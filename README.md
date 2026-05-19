@@ -14,12 +14,9 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 ## Repository structure
 
 ```
-/docs
-  /architecture       # Stable architecture reference docs
-    README.md
 /rfcs
-  0001-<feature>.md   # Accepted or in-review RFCs
-  0002-<feature>.md
+  20260519-<feature>.md   # Accepted or in-review RFCs
+  20260519-<feature>.md
 ```
 
 ## RFC lifecycle
@@ -28,7 +25,7 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 Idea → Draft PR → Community Review → Accepted / Withdrawn → Implementation
 ```
 
-1. **Draft** — open a PR adding `rfcs/NNNN-<short-name>.md`
+1. **Draft** — open a PR adding `rfcs/<date>-<short-name>.md`
 2. **Review** — use GitHub PR comments for architecture discussion; link the PR in GitHub Discussions for broader input
 3. **Accepted** — PR is merged; implementation PRs link back to the RFC
 4. **Withdrawn** — PR is closed with a summary of why
