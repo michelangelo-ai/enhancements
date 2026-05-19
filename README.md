@@ -80,4 +80,4 @@ This process is inspired by:
 
 ## Questions?
 
-Open a [GitHub Discussion](../../discussions) for process questions or early-stage ideas that aren't ready for a formal RFC yet.
+Open a GitHub Issue in michelangelo repo for questions or early-stage ideas that aren't ready for a formal RFC yet.
