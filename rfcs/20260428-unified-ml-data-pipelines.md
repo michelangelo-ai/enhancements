@@ -2,9 +2,7 @@
 
 | Field | Value |
 |---|---|
-| **Authors** | weric@uber.com |
-| **ERD uPlan** | [be39b094-286a-4f1c-b737-b2be2ea1e6d6](https://uplan.uberinternal.com/be39b094-286a-4f1c-b737-b2be2ea1e6d6) |
-| **uOwn Asset** | ML Platform |
+| **Authors** | weric |
 | **Date** | 2026-04-28 |
 | **Status** | Draft |
 
@@ -207,7 +205,7 @@ Create a parallel orchestration system for DE workloads, independent from Michel
 
 Replace the Michelangelo orchestration layer with an external system for generalized workflow orchestration.
 
-**Tradeoff:** Leverages existing community investment but requires migration of all existing Uniflow and Temporal-based workflows, loses Uber-specific platform integrations (RBAC, credential lifecycle, internal observability), and cedes platform control. Rejected as inconsistent with Non-Goals and with Michelangelo's role as an internal platform foundation.
+**Tradeoff:** Leverages existing community investment but requires migration of all existing Uniflow and Temporal-based workflows, loses platform-specific integrations (RBAC, credential lifecycle, observability), and cedes platform control. Rejected as inconsistent with Non-Goals and with Michelangelo's role as the orchestration foundation.
 
 ---
 
@@ -252,7 +250,6 @@ Feature flags will gate each phase independently. Existing workflows remain unaf
 
 ## References
 
-- Internal ERD: [be39b094-286a-4f1c-b737-b2be2ea1e6d6](https://uplan.uberinternal.com/be39b094-286a-4f1c-b737-b2be2ea1e6d6)
 - [Michelangelo platform overview](https://eng.uber.com/michelangelo-machine-learning-platform/)
 - [Kubernetes Enhancement Proposals (KEPs)](https://github.com/kubernetes/enhancements/tree/master/keps) — process inspiration
 - [Ray Enhancement Proposals (REPs)](https://github.com/ray-project/enhancements/tree/main/reps) — lightweight RFC format inspiration
