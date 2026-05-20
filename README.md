@@ -15,7 +15,7 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 
 ```
 /rfcs
-  0000-template.md        # Copy this to start a new RFC
+  20260101-template.md    # Copy this to start a new RFC
   20260519-<feature>.md   # Accepted or in-review RFCs
 ```
 
@@ -34,7 +34,7 @@ RFCs do not require unanimous approval, but significant objections from maintain
 
 ## Writing an RFC
 
-1. Copy [`rfcs/0000-template.md`](rfcs/0000-template.md) to `rfcs/YYYYMMDD-<short-name>.md`
+1. Copy [`rfcs/20260101-template.md`](rfcs/20260101-template.md) to `rfcs/YYYYMMDD-<short-name>.md`
 2. Fill in each section:
 
 | Section | Guidance |
