@@ -1,0 +1,77 @@
+# RFC-0000: \<Title\>
+
+- **Status:** Draft | In Review | Accepted | Withdrawn
+- **Author(s):** <!-- GitHub handles, e.g. @you -->
+- **Created:** YYYY-MM-DD
+- **Internal ERD:** <!-- uPlan link, if applicable -->
+
+---
+
+## Problem statement
+
+<!-- What is broken or missing today? Be specific about symptoms and impact. -->
+
+## Motivation
+
+<!-- Why solve this now? Who is affected and how severely? -->
+
+## Goals
+
+- <!-- Specific, verifiable outcome 1 -->
+- <!-- Specific, verifiable outcome 2 -->
+
+## Non-goals
+
+- <!-- What this RFC explicitly does not address -->
+
+## High-level architecture
+
+<!--
+Describe the proposed design. Diagrams strongly encouraged.
+Lucidchart exports as PNG/SVG and can be embedded as images.
+
+![Architecture diagram](../docs/architecture/images/my-diagram.png)
+-->
+
+## APIs and CRDs
+
+<!--
+List all public interface changes: new/modified Kubernetes CRDs,
+gRPC services, REST endpoints, Python SDK methods.
+
+Example:
+```yaml
+apiVersion: michelangelo.ai/v1alpha1
+kind: MyNewResource
+spec:
+  field: value
+```
+-->
+
+## Alternatives considered
+
+<!--
+At least one alternative with honest tradeoffs.
+
+### Alternative A: <name>
+**Pros:** ...
+**Cons:** ...
+**Why not chosen:** ...
+-->
+
+## Open questions
+
+- [ ] <!-- Unresolved decision that needs input before acceptance -->
+
+## Rollout strategy
+
+<!--
+- Phasing plan (alpha / beta / GA)
+- Feature flags used
+- Migration path for existing users
+- Rollback approach
+-->
+
+## References
+
+- <!-- Link to related issues, prior RFCs, or external designs -->
