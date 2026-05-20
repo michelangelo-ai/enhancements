@@ -1,7 +1,25 @@
 # Enhancement Design Team
 
 Team name: `enhancement-design`  
-Config: `.claude/team-config.json`
+Config: `.claude/design-team/team-config.json`
+
+## Setup — confirm repo paths before launching
+
+`team-config.json` uses two path placeholders that must be substituted before use:
+
+| Placeholder | Default | Description |
+|---|---|---|
+| `{{enhancements-repo}}` | current directory (this repo) | Absolute path to your `enhancements` clone |
+| `{{michelangelo-repo}}` | `../michelangelo` relative to enhancements | Absolute path to your `michelangelo` clone |
+
+When creating the team, confirm both paths with the user:
+
+```
+enhancements-repo: <current working directory>   # e.g. /home/you/michelangelo-ai/enhancements
+michelangelo-repo: <enhancements-repo>/../michelangelo  # e.g. /home/you/michelangelo-ai/michelangelo
+```
+
+Then substitute the placeholders in a local copy of `team-config.json` before spawning agents. Do **not** commit the substituted copy — it contains user-specific paths.
 
 ## Members
 
@@ -22,10 +40,10 @@ Config: `.claude/team-config.json`
 
 ## Findings files (written by agents)
 
-- `.claude/architect-findings.md` — architecture map, APIs, CRDs, data flows
-- `.claude/researcher-findings.md` — OSS ecosystem comparison, design lessons
-- `.claude/dev-advocate-findings.md` — DX audit, quality rubric, RFC DX checklist
-- `.claude/coder-findings.md` — implementation patterns, RFC implementation checklist
+- `{{enhancements-repo}}/.claude/design-team/architect-findings.md` — architecture map, APIs, CRDs, data flows
+- `{{enhancements-repo}}/.claude/design-team/researcher-findings.md` — OSS ecosystem comparison, design lessons
+- `{{enhancements-repo}}/.claude/design-team/dev-advocate-findings.md` — DX audit, quality rubric, RFC DX checklist
+- `{{enhancements-repo}}/.claude/design-team/coder-findings.md` — implementation patterns, RFC implementation checklist
 
 ## RFC output location
 
