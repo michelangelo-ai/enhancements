@@ -246,10 +246,3 @@ Centralize retry, recovery, and credential lifecycle into the control plane. Dep
 
 Feature flags will gate each phase independently. Existing workflows remain unaffected until they explicitly opt into new behaviors.
 
----
-
-## References
-
-- [Michelangelo platform overview](https://eng.uber.com/michelangelo-machine-learning-platform/)
-- [Kubernetes Enhancement Proposals (KEPs)](https://github.com/kubernetes/enhancements/tree/master/keps) — process inspiration
-- [Ray Enhancement Proposals (REPs)](https://github.com/ray-project/enhancements/tree/main/reps) — lightweight RFC format inspiration
