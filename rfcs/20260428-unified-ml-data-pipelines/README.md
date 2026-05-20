@@ -90,32 +90,7 @@ Expected platform improvements:
 
 The proposed architecture establishes five explicit layers with defined responsibilities:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Workflow Authoring Layer                    │
-│            Python SDK  │  Starlark  │  YAML                  │
-└────────────────────────┬────────────────────────────────────┘
-                         │  Workflow IR (normalized)
-┌────────────────────────▼────────────────────────────────────┐
-│               Orchestration Control Plane                     │
-│   Pipeline lifecycle · State · Retry/Recovery · Governance   │
-└────────────────────────┬────────────────────────────────────┘
-                         │  Orchestration intent
-┌────────────────────────▼────────────────────────────────────┐
-│                    Workflow Runtime                           │
-│        Temporal / Cadence (durable, dynamic DAG)             │
-└────────────────────────┬────────────────────────────────────┘
-                         │  Execution requests
-┌────────────────────────▼────────────────────────────────────┐
-│                  Execution Provider Layer                     │
-│              Spark  │  Ray  │  Kubernetes                    │
-└────────────────────────┬────────────────────────────────────┘
-                         │  Shared services
-┌────────────────────────▼────────────────────────────────────┐
-│                  Infrastructure Services                      │
-│     Metadata · Observability · RBAC · Credential Lifecycle   │
-└─────────────────────────────────────────────────────────────┘
-```
+![High-Level Architecture](architecture.png)
 
 ### Layer Responsibilities
 
