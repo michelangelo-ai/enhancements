@@ -40,10 +40,10 @@ Then substitute the placeholders in a local copy of `team-config.json` before sp
 
 ## Findings files (written by agents)
 
-- `{{enhancements-repo}}/.claude/design-team/architect-findings.md` — architecture map, APIs, CRDs, data flows
-- `{{enhancements-repo}}/.claude/design-team/researcher-findings.md` — OSS ecosystem comparison, design lessons
-- `{{enhancements-repo}}/.claude/design-team/dev-advocate-findings.md` — DX audit, quality rubric, RFC DX checklist
-- `{{enhancements-repo}}/.claude/design-team/coder-findings.md` — implementation patterns, RFC implementation checklist
+- `{{enhancements-repo}}/architect-findings.md` — architecture map, APIs, CRDs, data flows
+- `{{enhancements-repo}}/researcher-findings.md` — OSS ecosystem comparison, design lessons
+- `{{enhancements-repo}}/dev-advocate-findings.md` — DX audit, quality rubric, RFC DX checklist
+- `{{enhancements-repo}}/coder-findings.md` — implementation patterns, RFC implementation checklist
 
 ## RFC output location
 
