@@ -15,8 +15,8 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 
 ```
 /rfcs
+  20260101-template.md    # Copy this to start a new RFC
   20260519-<feature>.md   # Accepted or in-review RFCs
-  20260519-<feature>.md
 ```
 
 ## RFC lifecycle
@@ -25,7 +25,7 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 Idea → Draft PR → Community Review → Accepted / Withdrawn → Implementation
 ```
 
-1. **Draft** — open a PR adding `rfcs/<date>-<short-name>.md`
+1. **Draft** — copy `rfcs/20260101-template.md` to `rfcs/YYYYMMDD-<short-name>.md` and open a PR
 2. **Review** — use GitHub PR comments for architecture discussion; link the PR in GitHub Discussions for broader input
 3. **Accepted** — PR is merged; implementation PRs link back to the RFC
 4. **Withdrawn** — PR is closed with a summary of why
@@ -34,7 +34,8 @@ RFCs do not require unanimous approval, but significant objections from maintain
 
 ## Writing an RFC
 
-Copy the [RFC template](docs/architecture/README.md) and fill in:
+1. Copy [`rfcs/20260101-template.md`](rfcs/20260101-template.md) to `rfcs/YYYYMMDD-<short-name>.md`
+2. Fill in each section:
 
 | Section | Guidance |
 |---|---|
