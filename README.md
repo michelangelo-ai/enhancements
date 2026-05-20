@@ -25,7 +25,7 @@ Uber-internal concerns (privacy review, observability standards, internal servic
 Idea → Draft PR → Community Review → Accepted / Withdrawn → Implementation
 ```
 
-1. **Draft** — copy `rfcs/0000-template.md` to `rfcs/YYYYMMDD-<short-name>.md` and open a PR
+1. **Draft** — copy `rfcs/20260101-template.md` to `rfcs/YYYYMMDD-<short-name>.md` and open a PR
 2. **Review** — use GitHub PR comments for architecture discussion; link the PR in GitHub Discussions for broader input
 3. **Accepted** — PR is merged; implementation PRs link back to the RFC
 4. **Withdrawn** — PR is closed with a summary of why
