@@ -129,55 +129,6 @@ The proposed architecture establishes three physical deployment planes with defi
 | Platform-Managed Resiliency & Retries | Retries, caching, cleanup, and token updates are centralized platform features handled inside the control plane. Individual plugin developers and end-users do not write failure-handling code. |
 | Unified Observability | Every pipeline — whether written in Python or built on the UI Canvas — is translated into the exact same layout blueprint before running. This gives high-code and low-code workflows total parity for visual graphs and tracking. |
 
-### Unified Workflow IR
-
-All workflows — Python SDK, Starlark, and YAML — are normalized into a shared Intermediate Representation before execution. The IR is the canonical orchestration contract across the platform.
-
-The IR standardizes:
-
-- DAG structure and execution dependencies
-- Retry semantics
-- Observability and lineage metadata
-- Orchestration lifecycle hooks
-
-This makes high-code workflows first-class orchestration graphs rather than opaque execution artifacts, enabling visualization and observability parity with declarative workflows.
-
-### Dynamic DAG Execution
-
-Unlike static DAG systems where topology is fixed at submission time, the workflow runtime supports **late-bound topology**:
-
-- Conditional branching
-- Iterative execution
-- Runtime fan-out / fan-in
-- Dynamic task generation
-
-Orchestration behavior adapts to runtime state while preserving deterministic execution guarantees via Temporal/Cadence.
-
-### Control Plane as Orchestration Authority
-
-The Michelangelo API Server becomes the centralized orchestration authority responsible for:
-
-- Pipeline lifecycle management
-- Orchestration state persistence
-- Retry and recovery coordination
-- Trigger orchestration
-- Governance enforcement
-- Workflow reconciliation
-
-The control plane acts as the durable orchestration boundary between workflow definition and runtime execution, preventing orchestration semantics from leaking into SDKs or provider implementations.
-
----
-
-## APIs and CRDs
-
-*To be defined in follow-on implementation RFCs. This RFC establishes architectural boundaries; API surface changes will be proposed per component as implementation proceeds.*
-
-Key areas expected to produce public API changes:
-
-- **Workflow IR schema** — versioned contract for the normalized workflow representation
-- **Provider plugin interface** — standardized interface for registering and invoking execution providers
-- **Orchestration control plane API** — pipeline lifecycle, state query, and reconciliation endpoints
-
 ---
 
 ## Alternatives Considered
