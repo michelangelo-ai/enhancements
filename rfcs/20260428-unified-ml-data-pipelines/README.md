@@ -124,10 +124,10 @@ The proposed architecture establishes three physical deployment planes with defi
 
 | Principle | Description |
 |---|---|
-| Workload-Agnostic Orchestration | Orchestration primitives remain independent from ML-specific semantics |
-| Separation of Definition and Execution | Workflow definitions express intent; execution behavior is resolved through providers |
-| Platform-Managed Reliability | Retry, recovery, cleanup, and credential persistence are centralized platform responsibilities |
-| Unified Observability Model | All workflows converge into a shared visibility model regardless of authoring paradigm |
+| Workload-Agnostic Engine | The core system does not care if a task is an ML training script or a Data Engineering ETL pipeline. Every step is treated as a uniform, schedulable block. |
+| Separation of Setup and Execution (Server-Side Hydration) | The user construction plane should only emit the workflow DAG and high-level intent, completely stripped of platform implementation details. Following standard Declarative Programming Patterns, the authoring layer focuses entirely on *what* the pipeline should achieve, while the platform handles *how* it runs. This mirrors Kubernetes API Architecture, ensuring the user space remains independent of backend infrastructure updates and hydration. |
+| Platform-Managed Resiliency & Retries | Retries, caching, cleanup, and token updates are centralized platform features handled inside the control plane. Individual plugin developers and end-users do not write failure-handling code. |
+| Unified Observability | Every pipeline — whether written in Python or built on the UI Canvas — is translated into the exact same layout blueprint before running. This gives high-code and low-code workflows total parity for visual graphs and tracking. |
 
 ### Unified Workflow IR
 
