@@ -169,6 +169,8 @@ The implementation is phased to deliver value incrementally:
 
 ### Phase 1: Foundation (target: v0.3.0-rc.1)
 
+**Tracking:** [michelangelo-ai/michelangelo#1338](https://github.com/michelangelo-ai/michelangelo/issues/1338)
+
 1. Adopt conventional commits — update `CONTRIBUTING.md`
 2. Add `cliff.toml` — configure git-cliff
 3. Add PyPI publishing — modify `release.yaml`, set up `PYPI_TOKEN` secret
@@ -179,6 +181,8 @@ The implementation is phased to deliver value incrementally:
 **Rollback:** All changes are additive. Removing the new workflow steps restores prior behavior.
 
 ### Phase 2: Automation (target: v0.3.0)
+
+**Tracking:** [michelangelo-ai/michelangelo#1339](https://github.com/michelangelo-ai/michelangelo/issues/1339)
 
 7. Create `nightly.yml` — daily scheduled builds
 8. Create `changelog.yml` — auto-generated release notes
@@ -191,6 +195,8 @@ The implementation is phased to deliver value incrementally:
 **Rollback:** Disable cron schedules to stop nightlies. Remove tag triggers to revert to branch-only builds.
 
 ### Phase 3: Polish (target: v0.4.0)
+
+**Tracking:** [michelangelo-ai/michelangelo#1340](https://github.com/michelangelo-ai/michelangelo/issues/1340)
 
 14. Add Go binary cross-compilation
 15. Add CVE scanning on container images
