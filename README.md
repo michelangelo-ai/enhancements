@@ -50,6 +50,19 @@ RFCs do not require unanimous approval, but significant objections from maintain
 
 Keep RFCs focused on architecture. Full implementation details, internal operational playbooks, and large code blocks belong in the implementation PRs.
 
+## The RFC Lifecycle
+
+For all structural changes, developers must follow this four-stage design process before writing core engine code:
+
+1. **Proposal Creation:** Copy the baseline template from `rfcs/20260101-template.md` and open a Pull Request against this repository. Your proposal must include a Rollout Strategy mapped to upcoming live version milestones on GitHub.
+2. **Shepherd Assignment:** Within 3 business days, a core maintainer will be assigned as your official Shepherd. The Shepherd acts as your primary contact and guides your design through internal engineering reviews.
+3. **Review & Final Comment Period (FCP):** Community feedback occurs within the PR comments. Once resolved, the Shepherd triggers a 7-calendar-day FCP, acting as a "last call" before the design is locked and merged as **Accepted**.
+4. **Implementation & Release Branch Mapping:** Once accepted, the design serves as a formal architectural contract. The feature is mapped to an upcoming release milestone branch (for example, `release-0.2`), and tracking issues are opened in the core codebase.
+
+> **Operational Deadlines:**
+> * **First Pass SLA:** The Shepherd performs an initial review within 2 business days of assignment.
+> * **Stale Deadline:** RFC PRs with no author activity for 30 consecutive calendar days will be automatically closed.
+
 ## Contribution scenarios
 
 **Uber → open source** — internal ERD is created first for organizational alignment, then a public RFC PR is opened in this repo. Both Uber team members and external design partners review the GitHub PR simultaneously.

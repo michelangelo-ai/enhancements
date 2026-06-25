@@ -15,6 +15,8 @@ labels: enhancement
 assignees: ''
 ---
 
+> ⚠️ **STOP:** Major features and architectural changes require a design contract before implementation begins. If this is a major change, do not open an issue and instead open an RFC proposal directly in the [Michelangelo Enhancements Repository](https://github.com/michelangelo-ai/enhancements).
+
 ## Problem statement
 
 <!-- What problem does this solve? Who is affected? -->
