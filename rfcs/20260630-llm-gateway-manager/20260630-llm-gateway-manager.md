@@ -59,36 +59,58 @@ From a pipeline author's perspective, the change is invisible. Two environment v
 
 ## High-level architecture
 
+The registry is keyed by `"namespace/name"` of the `LLMGateway` CRD — one `LLMGatewayManager` instance per gateway, shared across all projects that reference it. Multiple projects independently call `IssueKey()` and each receive their own `sk-...` virtual key with their own budget.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                     MICHELANGELO CONTROL PLANE                       │
 │                                                                      │
 │  ┌─────────────────┐    ┌───────────────────────────────────────┐    │
 │  │ Project         │    │        LLM Gateway Controller         │    │
-│  │ Management      │───▶│  LLMGatewayManager  (interface)       │    │
-│  │ (API / UI)      │    │  IssueKey · RevokeKey · RotateKey     │    │
-│  └─────────────────┘    │  Health · SyncUsage · ListModels      │    │
-│                         │           │ llmgateway.New(name, cfg)  │    │
-│  ┌─────────────────┐    │   ┌───────▼──────────────────────┐   │    │
-│  │ Observability   │◀───│   │  internal registry            │   │    │
-│  │ Aggregator      │    │   │  "litellm"    → LLMGatewayManagerLiteLLM  │
-│  └─────────────────┘    │   │  "generic"    → LLMGatewayManagerGeneric  │
-│                         │   │  "portkey"    → LLMGatewayManagerPortkey  │
-│                         │   └───────────────────────────────┘   │    │
+│  │ Management      │───▶│                                       │    │
+│  │ (API / UI)      │    │  LLMGatewayReconciler                 │    │
+│  └─────────────────┘    │    → Health() every 10 min           │    │
+│                         │    → update CRD status.conditions     │    │
+│  Gateway resolved via:  │                                       │    │
+│  1. explicit gatewayRef │  KeySyncReconciler  (watches Project) │    │
+│  2. default annotation  │    → resolveGateway(project)         │    │
+│  3. skip (no gateway)   │    → IssueKey / RevokeKey / Rotate   │    │
+│                         │    → write sk-... to secret store     │    │
+│                         │    → inject env vars at exec time     │    │
+│                         │                                       │    │
+│                         │  UsageSyncReconciler                  │    │
+│                         │    → SyncUsage() every 5 min         │    │
+│                         │                                       │    │
+│                         │  Registry (singleton, thread-safe)   │    │
+│                         │    key: "namespace/name" of CRD      │    │
+│                         │    shared across all referencing      │    │
+│                         │    projects — one manager per GW     │    │
+│                         │  "ma-system/platform-default"        │    │
+│                         │      → LLMGatewayManagerLiteLLM      │    │
+│                         │  "ml-team/custom-gw"                 │    │
+│                         │      → LLMGatewayManagerPortkey      │    │
 │                         └───────────────────────────────────────┘    │
-└─────────────────────────────────┬────────────────────────────────────┘
-                                  │ HTTPS/mTLS · Bearer admin key
-                                  │ ClusterIP — intra-cluster only
-                                  ▼
+└─────────────────────────────────────┬────────────────────────────────┘
+                                      │ HTTPS/mTLS · Bearer admin key
+                                      │ ClusterIP — intra-cluster only
+                                      ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    DATA PLANE  (User's K8s cluster)                  │
+│             DATA PLANE  (shared gateway, multiple projects)          │
 │                                                                      │
-│  ┌──────────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
-│  │  LiteLLM Proxy   │  │  Portkey     │  │  Any OpenAI-compatible │ │
-│  │  (reference)     │  │  (community) │  │  proxy (Generic)       │ │
-│  └──────────────────┘  └──────────────┘  └────────────────────────┘ │
+│  LLMGateway: michelangelo-system/platform-default                   │
+│  annotation: michelangelo.ai/default-gateway: "true"                │
+│  annotation: michelangelo.ai/shared: "true"                         │
 │                                                                      │
-│  Pipeline code: MICHELANGELO_LLM_GATEWAY_URL + MICHELANGELO_LLM_VIRTUAL_KEY │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │  LiteLLM Proxy (one instance)                                   │ │
+│  │  Project: ml-ranking   → sk-aaa  ($200/mo budget)              │ │
+│  │  Project: ml-ads-ctr   → sk-bbb  ($100/mo budget)              │ │
+│  │  Project: ml-search    → sk-ccc  ($500/mo budget)              │ │
+│  │  ← same manager instance, separate virtual keys per project    │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  Pipeline env vars (injected by Michelangelo, standard across all): │
+│  MICHELANGELO_LLM_GATEWAY_URL + MICHELANGELO_LLM_VIRTUAL_KEY        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,24 +118,83 @@ For the full interface definition, CRD spec, reference implementation sketch, se
 
 ## APIs and CRDs
 
-<!-- To be filled in by the enhancement-design team (Architect agent, Task #1). Pending architecture exploration of pkg/llmgateway/ layout, CRD versioning conventions, and gRPC/REST endpoint patterns in the existing control plane. -->
-
 ### New CRD: `LLMGateway` (`michelangelo.ai/v1alpha1`)
 
-See [design document §6](https://vibe-mcp.uberinternal.com/v/webdocs/#/d/litellm-michelangelo-integration-oss-proposal) for the full CRD spec. Key fields:
+The CRD is **namespace-scoped** — consistent with all existing Michelangelo CRDs. A gateway in namespace A can be referenced by projects in namespace B by adding the `michelangelo.ai/shared: "true"` annotation. Without that annotation, cross-namespace references are rejected by the controller.
 
 ```yaml
 apiVersion: michelangelo.ai/v1alpha1
 kind: LLMGateway
+metadata:
+  name: platform-default
+  namespace: michelangelo-system
+  annotations:
+    michelangelo.ai/shared: "true"           # allows cross-namespace project references
+    michelangelo.ai/default-gateway: "true"  # auto-assigned to projects with is_generative_ai=true
 spec:
   managerName: litellm          # selects LLMGatewayManager implementation
   endpoint: "https://..."       # gateway base URL
-  adminKeyRef: { ... }          # reference to admin key in Michelangelo secret store
+  adminKeyRef:
+    secretName: litellm-admin-key
+    key: master-key
   defaultKeyPolicy:
     monthlyBudgetUSD: 500.0
     hardBudgetEnforcement: false
     tpmLimit: 100000
-    allowedModels: [...]
+    allowedModels: ["gpt-4o", "gemini-2.0-flash"]
+```
+
+**Shared gateway rules:**
+- `michelangelo.ai/shared: "true"` is required for a project in namespace B to reference a gateway in namespace A.
+- Cross-namespace refs use the format `[namespace/]name` in `gatewayRef` (e.g., `michelangelo-system/platform-default`). Same-namespace refs use just `name`.
+- A gateway without the shared annotation is namespace-private.
+
+**Default gateway rules:**
+- Only one gateway per cluster may carry `michelangelo.ai/default-gateway: "true"`. The controller validates uniqueness.
+- The default gateway must live in `michelangelo-system` (the platform namespace).
+- Auto-assignment targets projects where `ProjectSpec.TypeInfo.IsGenerativeAi == true` **and** `ProjectSpec.LLMGatewayRef` is unset.
+
+### Proto addition: `LLMGatewayRef` in `ProjectSpec`
+
+```protobuf
+// project.proto — field 11 added to ProjectSpec
+message LLMGatewayRef {
+  // gateway_ref is "[namespace/]name" of the LLMGateway CRD.
+  // Omit namespace for same-namespace; include for cross-namespace (requires shared annotation).
+  string gateway_ref = 1;
+
+  // key_policy overrides the gateway's defaultKeyPolicy for this project.
+  // If unset, the gateway's defaultKeyPolicy applies.
+  KeyPolicy key_policy = 2;
+}
+
+message ProjectSpec {
+  // ... existing fields 1-10 ...
+  LLMGatewayRef llm_gateway_ref = 11;
+}
+```
+
+### `KeySyncReconciler` gateway resolution
+
+```go
+func (r *KeySyncReconciler) resolveGateway(ctx context.Context, project *v1.Project) (*v1alpha1.LLMGateway, error) {
+    // 1. Explicit reference from project spec.
+    if ref := project.Spec.LLMGatewayRef.GetGatewayRef(); ref != "" {
+        return r.lookupGateway(ctx, project.Namespace, ref)
+    }
+
+    // 2. Default gateway — only for generative AI projects.
+    if project.Spec.TypeInfo.GetIsGenerativeAi() {
+        gw, err := r.findDefaultGateway(ctx)
+        if err == nil {
+            return gw, nil
+        }
+        // No default gateway configured: skip without error.
+    }
+
+    // 3. Skip — project has no LLM gateway.
+    return nil, nil
+}
 ```
 
 ### New Go interface: `pkg/llmgateway/manager.go`
@@ -128,6 +209,8 @@ type LLMGatewayManager interface {
     ListModels(ctx context.Context) ([]ModelSpec, error)
 }
 ```
+
+`ErrNotSupported` may be returned by any method. Callers treat it as a signal to skip — not an error condition. The registry is keyed by `"namespace/name"` of the `LLMGateway` CRD. One `LLMGatewayManager` instance is created per gateway and reused across all projects that reference it. The registry is protected by `sync.RWMutex`.
 
 ### Pipeline environment variables
 
@@ -158,7 +241,10 @@ type LLMGatewayManager interface {
 - [ ] **Push vs. pull for `SyncUsage`** — Should Michelangelo expose a webhook receiver so managers can push spend data rather than polling? LiteLLM supports `success_callback` to a custom endpoint. Evaluate in Phase 2.
 - [ ] **Budget enforcement default** — Soft cap (Michelangelo alerts) vs. hard cap (gateway blocks requests at limit). Proposal: soft cap as OSS default; hard cap opt-in via `keyPolicy.hardBudgetEnforcement: true`.
 - [ ] **Community certification** — Should the project maintain a compatibility test suite that community implementations run against to be listed as "verified"? Proposed for Phase 3.
-- [ ] **`LLMGateway` CRD scope** — Cluster-scoped or namespace-scoped? Namespace-scoped is consistent with existing Michelangelo CRDs; cluster-scoped would allow a shared gateway to serve multiple namespaces without per-namespace CRDs.
+
+**Resolved:**
+- ~~**`LLMGateway` CRD scope**~~ → **Namespace-scoped** (consistent with existing Michelangelo CRDs). Cross-namespace sharing is opt-in via `michelangelo.ai/shared: "true"` annotation. Cluster-scoped CRDs create cluster-admin RBAC requirements that conflict with the multi-tenant model.
+- ~~**Default gateway mechanism**~~ → **Annotation-based** (`michelangelo.ai/default-gateway: "true"` on a gateway in `michelangelo-system`). Auto-assigned to projects with `IsGenerativeAi == true` and no explicit `LLMGatewayRef`. No new CRD or webhook required.
 
 ## Rollout strategy
 
