@@ -3,8 +3,6 @@
 - **Status:** Draft
 - **Author(s):** @sally-lee
 - **Created:** 2026-06-30
-- **Internal ERD:** [Michelangelo Split Plan ERD](https://docs.google.com/document/d/1lDOPO_L6sPrnJiNIChOKpUW5rpwpcd22nWIK79OgDTs/edit?tab=t.0#heading=h.gnz1w8qew1we) · [Leadership Strategy Alignment](https://docs.google.com/document/d/18WE3ucx-6dZpkJPKRTHsnOH8IN23aT3uLhojSn355B4/edit?tab=t.0)
-- **Design doc:** [OSS Proposal webdoc](https://vibe-mcp.uberinternal.com/v/webdocs/#/d/litellm-michelangelo-integration-oss-proposal)
 
 ---
 
