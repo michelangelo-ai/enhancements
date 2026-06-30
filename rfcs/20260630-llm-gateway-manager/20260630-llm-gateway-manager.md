@@ -260,10 +260,6 @@ type LLMGatewayManager interface {
 
 ## References
 
-- [Design document — Michelangelo LLM Gateway: Pluggable Manager Design](https://vibe-mcp.uberinternal.com/v/webdocs/#/d/litellm-michelangelo-integration-oss-proposal)
-- [Integration plan — LiteLLM × Michelangelo](https://vibe-mcp.uberinternal.com/v/webdocs/#/d/litellm-michelangelo-integration)
-- [M0 Staging Dashboard](https://vibe-mcp.uberinternal.com/v/webdocs#/d/ma-litellm-m0)
 - [RFC-20260427: Michelangelo Control Plane Helm Chart](../20260427-michelangelo-helmchart/20260427-michelangelo-helmchart.md) — establishes Helm chart conventions this RFC extends
 - [LiteLLM Virtual Keys API](https://docs.litellm.ai/docs/proxy/virtual_keys)
 - [LiteLLM Spend Tracking](https://docs.litellm.ai/docs/proxy/cost_tracking)
-- [Kubernetes Enhancement Proposals (KEPs)](https://github.com/kubernetes/enhancements) — process inspiration
