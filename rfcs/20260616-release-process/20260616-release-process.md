@@ -1,6 +1,6 @@
 # RFC-20260616: Coordinated Release Process
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Author(s):** @sallycr
 - **Created:** 2026-06-16
 
@@ -218,3 +218,6 @@ The implementation is phased to deliver value incrementally:
 - [git-cliff documentation](https://git-cliff.org/) — changelog generator
 - [PEP 440](https://peps.python.org/pep-0440/) — Python version identification
 - [OCI Artifacts spec](https://github.com/opencontainers/artifacts) — Helm OCI registry standard
+
+## Issues 
+
