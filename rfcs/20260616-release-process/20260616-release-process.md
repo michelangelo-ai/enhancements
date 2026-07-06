@@ -224,4 +224,3 @@ The implementation is phased to deliver value incrementally:
 - [michelangelo-ai/michelangelo#1338](https://github.com/michelangelo-ai/michelangelo/issues/1338) — Phase 1: Foundation — Release Infrastructure (v0.3.0)
 - [michelangelo-ai/michelangelo#1339](https://github.com/michelangelo-ai/michelangelo/issues/1339) — Phase 2: Automation — Nightly Builds, Changelog & Release Tooling (v0.3.0)
 - [michelangelo-ai/michelangelo#1340](https://github.com/michelangelo-ai/michelangelo/issues/1340) — Phase 3: Polish — Security, Compatibility & Retention (v0.4.0)
-- [michelangelo-ai/michelangelo#1436](https://github.com/michelangelo-ai/michelangelo/issues/1436) — ci: add failure notifications for scheduled workflows (Phase 3 sub-task)
