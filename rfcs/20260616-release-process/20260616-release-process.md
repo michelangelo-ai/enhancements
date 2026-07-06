@@ -219,5 +219,9 @@ The implementation is phased to deliver value incrementally:
 - [PEP 440](https://peps.python.org/pep-0440/) — Python version identification
 - [OCI Artifacts spec](https://github.com/opencontainers/artifacts) — Helm OCI registry standard
 
-## Issues 
+## Issues
 
+- [michelangelo-ai/michelangelo#1338](https://github.com/michelangelo-ai/michelangelo/issues/1338) — Phase 1: Foundation — Release Infrastructure (v0.3.0)
+- [michelangelo-ai/michelangelo#1339](https://github.com/michelangelo-ai/michelangelo/issues/1339) — Phase 2: Automation — Nightly Builds, Changelog & Release Tooling (v0.3.0)
+- [michelangelo-ai/michelangelo#1340](https://github.com/michelangelo-ai/michelangelo/issues/1340) — Phase 3: Polish — Security, Compatibility & Retention (v0.4.0)
+- [michelangelo-ai/michelangelo#1436](https://github.com/michelangelo-ai/michelangelo/issues/1436) — ci: add failure notifications for scheduled workflows (Phase 3 sub-task)
