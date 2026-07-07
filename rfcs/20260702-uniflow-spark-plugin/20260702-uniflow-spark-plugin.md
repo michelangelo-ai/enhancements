@@ -314,3 +314,7 @@ Purely additive — no phasing, feature flags, or migration needed:
 - `python/michelangelo/uniflow/plugins/ray/task.py` + `task.star` — `RayTask` (second reference point for the `TaskConfig` plugin shape)
 - `go/worker/plugins/spark/starlark_module.go` — `spark.create_job`/`spark.sensor_job` builtins
 - `proto/api/v2/spark_job.proto` — `SparkJobSpec` schema
+
+## Issues
+
+- [michelangelo-ai/michelangelo#1457](https://github.com/michelangelo-ai/michelangelo/issues/1457) — `SparkApplication.Type` is hardcoded to `Python` regardless of entrypoint language (`go/components/spark/job/client/client.go:54`). Found while sandbox-validating the `core/lib/spark` builtins this RFC's implementation depends on; doesn't currently break execution (the operator falls back to `--class` when `main_class` is set) but the declared CRD type is wrong for jar/Scala entrypoints.
