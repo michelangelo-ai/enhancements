@@ -1,4 +1,4 @@
-# RFC-20260702-uniflow-spark-plugin: SparkPlugin — Custom Spark Entrypoints Without a Wrapped Python Task
+# RFC-20260702-uniflow-spark-plugin: `run_spark_job()` — Custom Spark Entrypoints Without a Wrapped Python Task
 
 - **Status:** Draft
 - **Author(s):** @sallycr
@@ -18,114 +18,109 @@ There is a large population of Spark users whose jobs are not, and should not ne
 
 ## Goals
 
-- Let a custom Spark entrypoint (Scala/JVM jar + `main_class`, or a standalone `.py` script) run as a Uniflow task via a new `TaskConfig` plugin, `SparkPlugin`, with no Python wrapper function containing real job logic.
+- Let a custom Spark entrypoint (Scala/JVM jar + `main_class`, or a standalone `.py` script) run through Uniflow via a single function, `run_spark_job()`, callable directly inside a `@workflow()` body — no Python wrapper function containing real job logic, and no `TaskConfig`/`@task` wrapper either (see "High-level architecture" for why).
 - Support both a local/dev run path (for iteration without a live cluster) and a remote run path through the existing production submission mechanism.
-- Reuse the existing `spark.create_job`/`spark.sensor_job` Starlark builtins and the existing `SparkJob` resource schema — introduce no new backend infrastructure.
-- Make the trade-off between "wrapped Uniflow task with full typed I/O" and "custom `SparkPlugin` entrypoint with job-status-only output" explicit and unsurprising to users.
+- Reuse the existing `SparkJobSpec` resource schema and `SparkJobService` — introduce the smallest possible amount of new backend surface: one new combined Starlark builtin (`spark.run_job`), built by composing the two Cadence activities `spark.create_job`/`spark.sensor_job` already use internally.
+- Make the trade-off between "wrapped Uniflow task with full typed I/O" (`SparkTask`) and "custom entrypoint with job-status-only output" (`run_spark_job()`) explicit and unsurprising to users.
 
 ## Non-goals
 
 - This RFC does not change or replace `SparkTask`. It remains the right choice for anyone who wants typed data passed automatically between workflow steps.
-- This RFC does not add typed input/output marshaling for `SparkPlugin` tasks. A custom entrypoint's driver process (a JVM, or a bare `spark-submit`-launched Python script) never calls into Uniflow's I/O registry, so `SparkPlugin` tasks return job status only — a deliberate, permanent limitation, not a phase-1 gap to close later.
+- This RFC does not add typed input/output marshaling for custom entrypoints. A custom entrypoint's driver process (a JVM, or a bare `spark-submit`-launched Python script) never calls into Uniflow's I/O registry, so `run_spark_job()` returns job status only — a deliberate, permanent limitation, not a phase-1 gap to close later.
 - This RFC does not modify the `TaskConfig` ABC, `RayTask`, or `SparkTask`.
-- This RFC does not add a new Starlark builtin or backend activity. `spark.create_job`/`spark.sensor_job` (`go/worker/plugins/spark/starlark_module.go`) already provide the submit-then-wait mechanism this feature needs.
+- This RFC does not add a `TaskConfig` plugin, a `.star` file, or a local-run/`spark-submit` helper. An earlier draft of this RFC proposed all three (see "Alternatives considered" — Alternative D); none of them turned out to be necessary once we confirmed a `@task`-wrapped entrypoint's Python body is never actually invoked on the remote path (see below), which makes a plain function call the correct shape instead.
 
 ## High-level architecture
 
-`SparkPlugin` is a thin `TaskConfig` implementation next to the existing `SparkTask`, reusing infrastructure that's already in the repo:
+Custom Spark entrypoints are **not** modeled as a `TaskConfig`/`@task` plugin. Here's why: `SparkTask`'s Python task function body *is* meaningfully executed remotely — the Spark driver runs `run_task.py`, which imports the task's module and calls the function directly, so its body is real, live code on the remote path. A custom jar/script entrypoint has no such bridge: the driver process is the user's own jar or script, and it never calls back into any Python task function. Wrapping it in `@task(config=SomeTaskConfig(...))` would only produce a task whose Python body is dead code remotely (it would only ever run for local execution) — misleading, and solving a problem (getting a DAG node) that a plain function call already solves more directly, the same way `python/michelangelo/uniflow/plugins/pipeline/run.py`'s `run_pipeline()` does for child pipeline runs.
 
-- `spark.create_job(job, timeout_seconds=0) -> job` and `spark.sensor_job(job, timeout_seconds=0, poll_seconds=10, assert_condition_type=...) -> job` — existing Starlark builtins in `go/worker/plugins/spark/starlark_module.go`, already used by `SparkTask`'s `task.star`.
-- `SparkJobSpec` (`proto/api/v2/spark_job.proto`) — an existing resource spec with `main_class`, `main_application_file` ("e.g. jar or python file"), `main_args`, `deps.{jars, files, py_files}`, driver/executor pod specs, and `spark_conf`. This schema already supports both Scala/JVM and Python entrypoints.
+So the shape is a single function, callable directly inside a `@workflow()` body — no decorator, no config object:
 
 ```
-User @task(config=SparkPlugin(...))
-        |  TaskConfig.to_keywords() emits application_file, optional main_class, and the rest of the config
+User, inside @workflow() body:
+    run_spark_job(namespace=..., main_application_file=..., main_class=..., ...)
+        |
+        |  @star_plugin("spark.run_job") binding
         v
-plugins/spark/plugin_task.star  (new, thin — builds a SparkJob spec dict)
-        |  spark.create_job(job=spec)
-        v
-spark plugin builtin (existing)  --Activity-->  CreateSparkJob-style activity (existing)
-        |  spark.sensor_job(job=created, assert_condition_type=spark.succeeded_condition_type)
-        v
-spark plugin builtin (existing)  --Activity-->  SensorSparkJob-style activity, polling (existing)
+  ┌─────────────────────────────┬──────────────────────────────────────┐
+  │  Local execution              │  Remote execution (transpiled)         │
+  │  (plain Python call)          │  (core/build.py rewrites the call to   │
+  │                                │   __spark__.run_job(...))              │
+  ├─────────────────────────────┼──────────────────────────────────────┤
+  │  create_spark_job() ->         │  Go: spark.run_job builtin              │
+  │    APIClient.SparkJobService   │    (go/worker/plugins/spark/           │
+  │    .create_spark_job()         │     starlark_module.go)                │
+  │  poll_spark_job() ->           │    -> CreateSparkJob activity           │
+  │    .get_spark_job() in a loop  │    -> SensorSparkJob activity, polling  │
+  └─────────────────────────────┴──────────────────────────────────────┘
         |
         v
-terminal SparkJobStatus returned to the calling workflow step (job status only -- no data payload)
+terminal SparkJobStatus returned to the calling workflow body (job status only -- no data payload)
 ```
 
-The only new artifacts are one Python `TaskConfig` dataclass and one `.star` file; nothing changes in the Go worker or the resource schema.
+`spark.run_job` is new (see "APIs and CRDs"), combining the two Cadence activities `spark.create_job`/`spark.sensor_job` already execute separately — no new activities, no new resource schema, no new CRD.
 
-### Scope boundary: `SparkTask` keeps Uniflow I/O; `SparkPlugin` gets job status only
+### Scope boundary: `SparkTask` keeps Uniflow I/O; `run_spark_job()` gets job status only
 
 - `SparkTask` (unaffected): its Python entrypoint runs as the actual Spark driver process, so it can read/write through Uniflow's I/O registry — full typed input/output between workflow steps, same as `RayTask`.
-- `SparkPlugin` (new): covers any custom entrypoint — a Scala/JVM jar or a standalone PySpark script — whose driver process is not invoked as a Uniflow task function and therefore cannot call into that I/O system. Its callable returns only the terminal job status. If a downstream step needs data the job produced, that data must be written by the job itself to a location the caller already knows (a table, a blob/S3 path passed via `args`/`spark_conf`) and referenced explicitly in the next task's `args` — not read back through Uniflow's I/O registry.
+- `run_spark_job()` (new): covers any custom entrypoint — a Scala/JVM jar or a standalone PySpark script. Its driver process is not invoked as a Uniflow task function and therefore cannot call into that I/O system. It returns only the terminal job status. If a downstream step needs data the job produced, that data must be written by the job itself to a location the caller already knows (a table, a blob/S3 path passed via `args`/`spark_conf`) and referenced explicitly in the next step's `args` — not read back through Uniflow's I/O registry.
 
 ## APIs and CRDs
 
-No new CRDs, gRPC services, or REST endpoints. All changes are internal to the Python `uniflow` SDK.
+No new CRDs, gRPC services, or REST endpoints. One new Starlark builtin, `spark.run_job` (`go/worker/plugins/spark/starlark_module.go`), composing the same two Cadence activities (`CreateSparkJob`, `SensorSparkJob`) the existing `create_job`/`sensor_job` builtins already drive — `createJob`/`sensorJob`'s bodies are refactored into shared private helpers that `run_job` also calls, so behavior for the two existing builtins is unchanged.
 
-### New Python SDK class: `SparkPlugin(TaskConfig)` — `python/michelangelo/uniflow/plugins/spark/plugin_task.py`
+### New Python function: `run_spark_job()` — `python/michelangelo/uniflow/core/lib/spark/job.py`
+
+Lives alongside `create_job()`/`sensor_job()` (the separate, lower-level builtins already implemented in this file — see the "core/lib/spark builtins" work this RFC's implementation started with). `run_spark_job()` is their combined form, decorated `@star_plugin("spark.run_job")`:
 
 ```python
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional
+@star_plugin("spark.run_job")
+def run_spark_job(
+    namespace: str,
+    main_application_file: str,
+    main_class: str | None = None,
+    args: list[str] | None = None,
+    driver_cpu: int | None = None,
+    driver_memory: str | None = None,
+    executor_cpu: int | None = None,
+    executor_memory: str | None = None,
+    executor_instances: int | None = None,
+    spark_conf: dict[str, str] | None = None,
+    deps_jars: list[str] | None = None,
+    deps_py_files: list[str] | None = None,
+    image: str | None = None,
+    spark_version: str = "3.5.5",
+    timeout_seconds: int = 0,
+    poll_seconds: int = 10,
+) -> dict:
+    """Create a SparkJob and wait for it to reach a terminal state, synchronously.
 
-from michelangelo.uniflow.core.task_config import TaskBinding, TaskConfig
-
-_binding = TaskBinding(
-    star_file=Path(__file__).resolve().parent / "plugin_task.star",
-    function="spark_plugin_task",
-    export="__spark_plugin_task",
-)
-
-_config_binding = TaskBinding(
-    star_file=Path(__file__).resolve().parent / "plugin_task.star",
-    function="spark_plugin_config",
-    export="__spark_plugin_config",
-)
-
-
-@dataclass
-class SparkPlugin(TaskConfig):
-    """TaskConfig for submitting a custom Spark entrypoint (a Scala/JVM jar
-    with a main class, or a standalone PySpark script) without wrapping it
-    in a Uniflow task function. Returns job status only -- see Non-goals."""
-
-    application_file: str
-    main_class: Optional[str] = None
-    args: List[str] = field(default_factory=list)
-    driver_cpu: Optional[int] = None
-    driver_memory: Optional[str] = None
-    executor_cpu: Optional[int] = None
-    executor_memory: Optional[str] = None
-    executor_instances: Optional[int] = None
-    spark_conf: Dict[str, str] = field(default_factory=dict)
-    deps_jars: List[str] = field(default_factory=list)
-    deps_py_files: List[str] = field(default_factory=list)
-    namespace: str = "default"
-
-    def get_binding(self) -> TaskBinding:
-        return _binding
-
-    @classmethod
-    def get_config_binding(cls) -> TaskBinding:
-        return _config_binding
-
-    def pre_run(self):
-        """No-op -- the entrypoint manages its own runtime."""
-
-    def post_run(self):
-        """No-op -- see pre_run()."""
+    Local execution: calls create_spark_job() then poll_spark_job() directly
+    against APIClient.SparkJobService. Remote execution: transpiles to the
+    spark.run_job Starlark builtin, which does the equivalent via Cadence
+    activities. Returns job status only -- no data payload (see Non-goals).
+    """
+    created = create_spark_job(
+        namespace=namespace, main_application_file=main_application_file,
+        main_class=main_class, args=args, driver_cpu=driver_cpu,
+        driver_memory=driver_memory, executor_cpu=executor_cpu,
+        executor_memory=executor_memory, executor_instances=executor_instances,
+        spark_conf=spark_conf, deps_jars=deps_jars, deps_py_files=deps_py_files,
+        image=image, spark_version=spark_version,
+    )
+    return poll_spark_job(
+        namespace=namespace, name=created["metadata"]["name"],
+        timeout_seconds=timeout_seconds, poll_seconds=poll_seconds,
+    )
 ```
 
-`to_keywords()` is inherited unchanged from `TaskConfig` — it already converts non-`None` dataclass fields into Starlark keyword arguments, the same mechanism `RayTask`/`SparkTask` rely on.
+(Exact parameter list/defaults should match whatever `create_job()`/`sensor_job()` already settled on in `core/lib/spark/job.py` — this is illustrative, not a literal diff.)
 
-Field mapping onto the existing `SparkJobSpec`:
+Field mapping onto `SparkJobSpec` (unchanged from the original draft):
 
-| `SparkPlugin` field | `SparkJobSpec` field |
+| `run_spark_job()` param | `SparkJobSpec` field |
 |---|---|
-| `application_file` | `spec.main_application_file` |
+| `main_application_file` | `spec.main_application_file` |
 | `main_class` | `spec.main_class` (optional) |
 | `args` | `spec.main_args` |
 | `deps_jars` | `spec.deps.jars` |
@@ -133,187 +128,91 @@ Field mapping onto the existing `SparkJobSpec`:
 | `driver_cpu` / `driver_memory` | `spec.driver.pod.resource.{cpu,memory}` |
 | `executor_cpu` / `executor_memory` / `executor_instances` | `spec.executor.pod.resource.{cpu,memory}` / `spec.executor.instances` |
 | `spark_conf` | `spec.spark_conf` |
+| `image` | `spec.driver.pod.image` / `spec.executor.pod.image` (found missing during sandbox validation — see #1457-adjacent fix, required for the SparkOperator to actually schedule pods) |
 
-Field names deliberately mirror `SparkTask`'s existing `driver_cpu`/`driver_memory`/`executor_cpu`/`executor_memory`/`executor_instances` naming rather than inventing a second vocabulary for the same resource knobs.
+### New Go builtin: `run_job` — `go/worker/plugins/spark/starlark_module.go`
 
-### New `.star` file: `python/michelangelo/uniflow/plugins/spark/plugin_task.star`
-
-```python
-load("@plugin", "os", "spark", "time")
-load("../../commons.star", "TASK_STATE_FAILED", "TASK_STATE_KILLED", "TASK_STATE_SUCCEEDED", "get_task_image", "get_task_name", "report_progress")
-
-def spark_plugin_task(
-        task_path,
-        alias = None,
-        application_file = "",
-        main_class = None,
-        args = [],
-        driver_cpu = None,
-        driver_memory = None,
-        executor_cpu = None,
-        executor_memory = None,
-        executor_instances = None,
-        spark_conf = {},
-        deps_jars = [],
-        deps_py_files = [],
-        namespace = "default"):
-    def callable(*call_args, **call_kwargs):
-        task_name = get_task_name(task_path, alias)
-        image = get_task_image(task_name)
-        start_time = time.time()
-
-        spec = {
-            "driver": {"pod": {"resource": {"cpu": driver_cpu, "memory": driver_memory}, "image": image}},
-            "executor": {"pod": {"resource": {"cpu": executor_cpu, "memory": executor_memory}, "image": image}, "instances": executor_instances},
-            "sparkConf": spark_conf,
-            "mainApplicationFile": application_file,
-            "mainArgs": args,
-            "deps": {"jars": deps_jars, "pyFiles": deps_py_files},
-            "sparkVersion": "3.5.5",
-        }
-        if main_class:
-            spec["mainClass"] = main_class
-
-        job = {
-            "kind": "SparkJob",
-            "apiVersion": "michelangelo.api.v2",
-            "metadata": {"namespace": namespace, "generateName": "uniflow-splg-"},
-            "spec": spec,
-        }
-
-        response = spark.create_job(job)
-        created = response["sparkJob"]
-        final = spark.sensor_job(job = created, assert_condition_type = spark.succeeded_condition_type)
-
-        state = TASK_STATE_SUCCEEDED
-        conditions = final.get("status", {}).get("statusConditions", []) if type(final) == "dict" else []
-        for c in conditions:
-            if c and c["type"] == spark.killed_condition_type and c.get("status") == "CONDITION_STATUS_TRUE":
-                state = TASK_STATE_KILLED
-            if c and c["type"] == spark.succeeded_condition_type and c.get("status") == "CONDITION_STATUS_FALSE":
-                state = TASK_STATE_FAILED
-
-        report_progress(task_path = task_path, task_name = task_name, task_state = state, start_time = start_time, end_time = time.time(), task_message = "SparkPlugin job " + state, output = "")
-        return final
-
-    return callable
-
-def spark_plugin_config(driver_cpu = None, driver_memory = None, executor_cpu = None, executor_memory = None, executor_instances = None):
-    overrides = {"driver_cpu": driver_cpu, "driver_memory": driver_memory, "executor_cpu": executor_cpu, "executor_memory": executor_memory, "executor_instances": executor_instances}
-    return {k: v for k, v in overrides.items() if v != None}
-```
-
-This mirrors `SparkTask`'s existing `task.star`: build a `SparkJob` spec, `spark.create_job` it, `spark.sensor_job` it to a terminal state — just without the retry loop and `io_read_json(result_url)` step that only make sense for a wrapped Python entrypoint with cacheable args/kwargs.
-
-### New local-run helper: `python/michelangelo/uniflow/plugins/spark/local.py`
-
-```python
-import subprocess
-
-
-def run_spark_submit_local(config: "SparkPlugin", extra_args: list = None) -> dict:
-    cmd = ["spark-submit", "--master", "local[*]"]
-    if config.driver_memory:
-        cmd += ["--driver-memory", config.driver_memory]
-    if config.executor_memory:
-        cmd += ["--executor-memory", config.executor_memory]
-    if config.executor_instances:
-        cmd += ["--num-executors", str(config.executor_instances)]
-    if config.main_class:
-        cmd += ["--class", config.main_class]
-    for k, v in config.spark_conf.items():
-        cmd += ["--conf", f"{k}={v}"]
-    if config.deps_jars:
-        cmd += ["--jars", ",".join(config.deps_jars)]
-    if config.deps_py_files:
-        cmd += ["--py-files", ",".join(config.deps_py_files)]
-    cmd += [config.application_file, *config.args, *(extra_args or [])]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return {"stdout": result.stdout, "returncode": result.returncode}
-```
-
-Ships so users don't hand-roll subprocess code for local testing — the same config object drives both the local `spark-submit` invocation and the remote `SparkJob` payload.
+Registered alongside the existing `create_job`/`sensor_job` builtins in the same module. Implementation combines `createJob`'s activity-execution body and `sensorJob`'s poll loop (including its cancellation/`TerminateSparkJob` handling) into shared private helpers, then `runJob` calls both in sequence — mirroring how `go/worker/plugins/pipeline/starlark_module.go`'s `runPipeline` already combines its own create+sensor activities into one builtin. `createJob`/`sensorJob` remain available as separate builtins, calling the same extracted helpers, with unchanged behavior (covered by existing tests).
 
 ### Usage example
 
 ```python
-from michelangelo.uniflow.core import task, workflow
-from michelangelo.uniflow.plugins.spark.plugin_task import SparkPlugin
-from michelangelo.uniflow.plugins.spark.local import run_spark_submit_local
-
-# Scala/JVM
-_scala_config = SparkPlugin(
-    application_file="s3://my-bucket/my-app-1.0.jar",
-    main_class="com.example.MySparkApp",
-    args=["--date", "2026-07-02"],
-    executor_cpu=4, executor_memory="4G", executor_instances=10,
-)
-
-@task(config=_scala_config)
-def my_scala_spark_task(date: str) -> dict:
-    return run_spark_submit_local(_scala_config, extra_args=["--date", date])
-
-# Custom PySpark -- same plugin, no main_class, uses deps_py_files
-_pyspark_config = SparkPlugin(
-    application_file="s3://my-bucket/custom_job.py",
-    deps_py_files=["s3://my-bucket/shared_utils.zip"],
-)
-
-@task(config=_pyspark_config)
-def my_custom_pyspark_task(date: str) -> dict:
-    return run_spark_submit_local(_pyspark_config, extra_args=["--date", date])
-
+from michelangelo.uniflow.core import workflow
+from michelangelo.uniflow.core.lib.spark.job import run_spark_job
 
 @workflow()
 def my_pipeline(date: str):
-    my_scala_spark_task(date)
-    return my_custom_pyspark_task(date)
+    scala_result = run_spark_job(
+        namespace="ma-examples",
+        main_application_file="s3://my-bucket/my-app-1.0.jar",
+        main_class="com.example.MySparkApp",
+        args=["--date", date],
+        executor_cpu=4, executor_memory="4G", executor_instances=10,
+        image="my-registry/my-spark-image:latest",
+    )
+
+    # Custom PySpark -- same function, no main_class, uses deps_py_files
+    pyspark_result = run_spark_job(
+        namespace="ma-examples",
+        main_application_file="s3://my-bucket/custom_job.py",
+        deps_py_files=["s3://my-bucket/shared_utils.zip"],
+        args=["--date", date],
+        image="my-registry/my-spark-image:latest",
+    )
+
+    return [scala_result, pyspark_result]
 ```
+
+No `TaskConfig`, no `@task` decorator, no separate local-run helper — `run_spark_job()`'s own body already handles both local and remote execution via the `@star_plugin` binding.
 
 ## Alternatives considered
 
-### Alternative A: Build `plugin_task.star` directly against Kubernetes APIs, bypassing the `spark` plugin builtins
+### Alternative A: Wrap it as a `TaskConfig` plugin, `SparkPlugin(TaskConfig)` (original draft of this RFC)
 
-**Pros:** No dependency on the `spark` plugin module.
-**Cons:** `spark.create_job`/`spark.sensor_job` already implement the submit+wait sequence correctly, including status-condition checking and the job lifecycle `task.star` already relies on for `SparkTask`. Reimplementing this would duplicate real production logic.
-**Why not chosen:** No benefit over reusing the existing, already-correct mechanism.
+**Pros:** Consistent with `RayTask`/`SparkTask`'s existing plugin shape; `@task(config=...)` is a familiar pattern.
+**Cons:** For a custom jar/script entrypoint, the Spark driver process is the user's own jar or script — it never calls back into a Python task function the way `SparkTask`'s `run_task.py` does. Wrapping it in `@task(config=SparkPlugin(...))` would make the decorated Python function body dead code on the remote path (only ever executed locally), which is confusing and misrepresents what actually runs where.
+**Why not chosen:** A `TaskConfig` implies "this Python function's body is the task," which isn't true here. A direct function call (`run_spark_job(...)`) matches reality and mirrors `pipeline.run_pipeline()`, which has the same "no task body, just an orchestration call" shape.
 
-### Alternative B: Add a `local_callable` abstract method to the `TaskConfig` ABC
+### Alternative B (pure-Python wrapper, no new Go builtin): `run_spark_job()` implemented purely in Python, calling `create_job()`/`sensor_job()` internally without being itself `@star_plugin`-bound
 
-**Pros:** Would formalize a distinct local-run contract for plugins whose local behavior differs from "call the function in-process."
-**Cons:** Breaks the ABC contract for `RayTask`/`SparkTask`, both of which would need to implement it, with no benefit to those plugins.
-**Why not chosen:** Unjustified breaking change to an existing, working contract.
+**Pros:** Zero Go changes.
+**Cons:** Confirmed by tracing the transpiler (`core/build.py`'s `visit_Name`): any plain function referenced inside a `@workflow()` body that isn't itself `@task`/`@star_plugin`/`@workflow`/a `TaskConfig` hits a transpiler crash (`TypeError: issubclass() arg 1 must be a class`) — `@workflow()` bodies are transpiled to Starlark, and a bare Python function with real logic has no Starlark equivalent to transpile to. This wrapper would work fine as a standalone script but crash the moment it's called inside an actual `@workflow()` body — the primary use case.
+**Why not chosen:** Doesn't actually satisfy the goal of being callable directly inside a `@workflow()` body.
 
-### Alternative C: Keep it Scala-only (`ScalaSpark`), add a separate `PySparkPlugin` later if needed
+### Alternative C: Keep it Scala-only (`ScalaSpark`), add a separate PySpark variant later if needed
 
 **Pros:** Simpler initial scope.
-**Cons:** The underlying mechanism, config shape, and job-status-only limitation are identical regardless of entrypoint language — the only difference is whether `main_class` is populated and whether `deps_jars` or `deps_py_files` is used. A second plugin class would duplicate the entire `.star` wrapper for no benefit.
-**Why not chosen:** Generalizing to `SparkPlugin` costs nothing extra and directly serves both custom-Scala and custom-PySpark authors with one plugin.
+**Cons:** The underlying mechanism, config shape, and job-status-only limitation are identical regardless of entrypoint language — the only difference is whether `main_class` is populated and whether `deps_jars` or `deps_py_files` is used. A second function would duplicate the entire wrapper for no benefit.
+**Why not chosen:** Generalizing `run_spark_job()` to cover both costs nothing extra and directly serves both custom-Scala and custom-PySpark authors with one function.
+
+### Alternative D: `TaskConfig` plugin + new `.star` file + local `spark-submit` helper (superseded draft, kept for history)
+
+An earlier iteration of this RFC combined Alternative A's `TaskConfig` shape with a new `plugins/spark/plugin_task.star` file and a `local.py` helper that shelled out to `spark-submit` for local iteration. Once Alternative A was rejected (see above), the `.star` file and the `spark-submit` helper were no longer needed either: the chosen design's local path already runs via `core/lib/spark/job.py`'s plain Python calls against `APIClient.SparkJobService`, with no separate local-run mechanism required.
 
 ## Open questions
 
-- [ ] `SparkTask` supports result caching keyed on Python args/kwargs (`cache_version`/`cache_enabled`). `SparkPlugin` has no serializable Python args to key a cache on — should caching be out of scope for v1?
-- [ ] Confirm the condition-checking logic in `plugin_task.star` (killed/succeeded checks) matches what `spark.sensor_job`'s blocking-until-terminal behavior actually returns, cross-checked against `SparkTask`'s own `report_spark_job_terminated`.
-- [ ] Should `SparkPlugin.__post_init__` validate that `main_class` is set when `application_file` ends in `.jar`, or is silent omission acceptable?
-- [ ] `SparkTask` has a retry loop (`retry_attempts`) — should `SparkPlugin` support the same, given it has no cache/result state to reconcile between attempts?
-- [ ] Test strategy: for `.star` testing, is there an existing Starlark test harness pattern (e.g. `go/worker/plugins/spark/starlark_module_test.go`) that `SparkPlugin`'s tests should follow?
+- [x] ~~Test strategy: for `.star`/Starlark testing, is there an existing test harness pattern that this feature's tests should follow?~~ **Resolved:** yes — `go/worker/plugins/spark/starlark_module_test.go`'s existing `suite.Suite` pattern (mock activities via `env.RegisterActivity`/`env.OnActivity`, execute a named Starlark test function via `s.env.Cadence.ExecuteFunction`). The new `run_job` builtin's test (`TestRunJobSuccessfully`) reuses this pattern directly, extending `testdata/test.star` with a `test_run_job()` function.
+- [ ] `SparkTask` supports result caching keyed on Python args/kwargs (`cache_version`/`cache_enabled`). `run_spark_job()` has no serializable Python args to key a cache on (job specs are structural, not memoizable business logic) — should caching be out of scope for v1? Current answer: yes, out of scope — a re-run should just submit a new job.
+- [ ] Should `run_spark_job()` validate that `main_class` is set when `main_application_file` ends in `.jar`, or is silent omission acceptable (SparkOperator will surface its own error either way)?
+- [ ] `SparkTask` has a retry loop (`retry_attempts`) — should `run_spark_job()` support the same at the Python level, or is relying on `@workflow()`-level retry (if any) sufficient?
 
 ## Rollout strategy
 
 Purely additive — no phasing, feature flags, or migration needed:
 
 - `TaskConfig`, `RayTask`, and `SparkTask` are all unchanged.
-- Users adopt `SparkPlugin` by importing it and passing it to `@task(config=SparkPlugin(...))` — there is no migration path because there is nothing to migrate from for this specific plugin.
-- No new infrastructure to deploy: `spark.create_job`, `spark.sensor_job`, their backing activities, and the `SparkJobSpec` schema's dual-entrypoint support all already exist.
-- Recommended rollout: land the Python dataclass + `.star` file + local-run helper together, validate against a real jar and a real standalone `.py` script, then document the plugin (README + docs page covering the job-status-only limitation) before wider announcement.
+- Users adopt `run_spark_job()` by importing it and calling it directly inside a `@workflow()` body — there is no migration path because there is nothing to migrate from for this specific capability.
+- New infrastructure to deploy: the `spark.run_job` Starlark builtin (`go/worker/plugins/spark/starlark_module.go`) needs to ship in the worker build before any remote `@workflow()` calling `run_spark_job()` can execute on the remote path; the Python side (`core/lib/spark/job.py`) can land independently for local-execution testing.
+- Recommended rollout: land the Go `run_job` builtin and the Python `run_spark_job()` function together (they're two halves of the same feature), validate end-to-end against a real jar and a real standalone `.py` script — both locally and via `ma pipeline run` on the sandbox — then document (README covering the job-status-only limitation) before wider announcement.
 
 ## References
 
-- `python/michelangelo/uniflow/core/task_config.py` — `TaskConfig`/`TaskBinding` (existing plugin pattern this design follows)
-- `python/michelangelo/uniflow/plugins/spark/task.py` + `task.star` — `SparkTask` (existing wrapped-task plugin, the reference implementation for `SparkPlugin`)
-- `python/michelangelo/uniflow/plugins/ray/task.py` + `task.star` — `RayTask` (second reference point for the `TaskConfig` plugin shape)
-- `go/worker/plugins/spark/starlark_module.go` — `spark.create_job`/`spark.sensor_job` builtins
-- `proto/api/v2/spark_job.proto` — `SparkJobSpec` schema
+- `python/michelangelo/uniflow/plugins/pipeline/run.py` — `run_pipeline()`, the reference pattern this design follows: a plain `@star_plugin`-bound function, callable directly inside a `@workflow()` body, no `TaskConfig`/`@task` wrapper.
+- `python/michelangelo/uniflow/core/lib/spark/job.py` — `create_job()`/`sensor_job()` (existing lower-level builtins) and `run_spark_job()` (this RFC's combined function).
+- `python/michelangelo/uniflow/plugins/spark/task.py` + `task.star` — `SparkTask` (existing wrapped-task plugin; contrast case, not the pattern followed here).
+- `go/worker/plugins/spark/starlark_module.go` — `create_job`/`sensor_job` builtins (existing) and `run_job` (new, this RFC).
+- `go/worker/plugins/pipeline/starlark_module.go` — `runPipeline`, the reference pattern for combining create+sensor activities into a single Go builtin.
+- `proto/api/v2/spark_job.proto` — `SparkJobSpec` schema.
 
 ## Issues
 
