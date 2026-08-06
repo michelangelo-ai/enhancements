@@ -91,9 +91,35 @@ No proto/CRD schema changes. This RFC proposes Go-level changes only:
   the existing inline logic in `generatePipelineRunRequest`
   (`cron_trigger_workflows.go:309-313`), reused by any other trigger re-fire path (e.g. backfill)
   that creates a new `PipelineRun` from a parent that may carry the label.
-- The default value becomes a package-level configuration point rather than a bare string
-  literal, so an operator can override it without a code change (exact configuration surface —
-  Helm value vs. ConfigMap key vs. compile-time constant — is an open question below).
+- The default value is **operator-configurable**, not a bare string literal or compile-time
+  constant — see the new "Default value configuration" subsection below. Different deployments of
+  this platform have already expressed wanting different out-of-the-box defaults (one wants
+  unlabeled runs to default to `"development"`, another to `"production"`), which rules out a
+  single hardcoded value for everyone.
+
+### Default value configuration
+
+Add an `apiserver.pipelineRunDefaults.environment` Helm value (default unset), rendered into the
+existing apiserver and worker ConfigMaps at install time — following the same
+Helm-value-to-ConfigMap-to-Go-struct pattern already used for other operator settings (e.g. the
+`Config` struct populated via `provider.Get(configKey).Populate(&conf)` in
+`go/controllermgr/config.go:7-25`). Both `go/api/handler` (create-time defaulting) and
+`go/worker` (trigger re-fire propagation) read the same rendered value via this pattern, injected
+at process startup rather than read from a package-level global, so `setDefaultEnvironmentLabel`
+and `defaultOrPropagateEnvironmentLabel` both take the configured default as a parameter.
+
+If the operator sets no value, the packaged Helm chart ships a default-of-defaults of
+`"development"` — the conservative failure mode, since an unlabeled run silently defaulting to
+`"production"` risks it being swept into production-scoped cost/policy/promotion logic, whereas
+defaulting to `"development"` fails safe.
+
+This RFC scopes the configuration to a single, global, per-deployment value (one Helm value per
+install), not a per-namespace or per-project override. The motivating scenario — different
+deployments wanting different defaults — is fully solved by a per-install Helm value with no
+in-cluster override needed. Per-namespace override would require a new lookup path (namespace-
+scoped ConfigMap or CRD field) with its own precedence rules, which is a materially larger scope
+than "make the constant configurable" and is left to a follow-up RFC if a single-cluster,
+multi-tenant need for differing defaults emerges.
 
 ## Alternatives considered
 
@@ -129,10 +155,10 @@ documentation as one of several changes, not a substitute for the code fix).
 
 ## Open questions
 
-- [ ] What is the right default value, and where does an operator configure it (Helm value,
-  ConfigMap key, or a per-`Project`/`Pipeline` override)? The existing trigger-path fallback of
-  `"production"` and this RFC's motivating discussion of `"development"` disagree — this must be
-  resolved, not left as two different defaults on two different code paths.
+- [x] ~~What is the right default value, and where does an operator configure it?~~ **Resolved:**
+  a single global `apiserver.pipelineRunDefaults.environment` Helm value per deployment, defaulting
+  to `"development"` if unset when not otherwise specified. See "Default value configuration"
+  above. Per-namespace/per-project override is explicitly deferred to a follow-up RFC.
 - [ ] Should the label be widened beyond `PipelineRun` (e.g. to `Project`/`Pipeline`/`TriggerRun`)
   before or after this change ships? Building defaulting on a `PipelineRun`-scoped label now makes
   a later widening a breaking rename.
