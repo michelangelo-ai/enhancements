@@ -1,0 +1,168 @@
+# RFC-20260806-pipelinerun-environment-label-defaulting: Default and Propagate the PipelineRun Environment Label
+
+- **Status:** Draft
+- **Author(s):** @sallycr
+- **Created:** 2026-08-06
+- **Internal ERD:** N/A
+
+---
+
+## Problem statement
+
+`PipelineRun` objects carry a `pipelinerun.michelangelo/environment` label (defined in
+`go/worker/workflows/trigger/cron_trigger_workflows.go:48`) that downstream consumers already
+rely on for metrics/attribution (`go/components/pipelinerun/controller.go:633-642`'s
+`getEnvironment()`, which falls back to `"unknown"` when the label is absent) and for
+schedule-drift detection (`go/components/triggerrun/schedule_input.go:58-72`). Today, however:
+
+- `PipelineRun`s created directly through the API (not via a scheduled `TriggerRun`) never get
+  this label set at all — callers must remember to set it themselves, and most don't, hence the
+  `"unknown"` fallback in production usage.
+- The one place propagation *does* happen — `generatePipelineRunRequest` in
+  `cron_trigger_workflows.go:299-313`, when a scheduled `TriggerRun` fires a new `PipelineRun` —
+  hardcodes `"production"` as its fallback default, inline, with no shared source of truth.
+- The label key itself is defined as two independent string literals
+  (`EnvironmentLabel` in `cron_trigger_workflows.go:48` and `scheduleInputEnvironmentLabel` in
+  `schedule_input.go:13`), which can silently drift.
+- Nothing documents this label's meaning, default value, or override mechanism today.
+
+## Motivation
+
+Any user or dashboard that filters, alerts on, or attributes cost by this label is working with
+incomplete data whenever a `PipelineRun` is created directly through the API — a large fraction of
+runs simply have no value and fall back to `"unknown"`. As more of the platform (cost reporting,
+environment-scoped policy, promotion workflows) comes to depend on knowing a run's environment,
+this gap becomes a correctness problem, not just a cosmetic one. Solving it now, before more
+features are built on top of an inconsistently-labeled resource, avoids compounding the problem.
+
+## Goals
+
+- `PipelineRun`s created without an explicit environment label receive a sensible, configurable
+  default at creation time, regardless of whether they were created directly via the API or fired
+  by a scheduled `TriggerRun`.
+- When a new `PipelineRun` is regenerated from a parent resource that already carries the label
+  (e.g. a scheduled re-fire), the value is propagated forward rather than re-derived.
+- The environment-label key and default value are defined in exactly one place, imported by both
+  `go/api` and `go/worker`.
+- The change is visible: any time a default is injected, it is discoverable via a logged event or
+  the object's own labels — never silent, unexplainable state.
+
+## Non-goals
+
+- Adding a typed `environment` field to the `PipelineRun` proto/CRD schema — the label remains a
+  free-form key on the standard `ObjectMeta.Labels` map (`proto/api/v2/pipeline_run.proto:696-697`
+  requires no changes for this RFC).
+- Widening the label to other resource kinds (`Project`, `Pipeline`, `TriggerRun`) in this RFC.
+  The naming/scoping question below is flagged as an open question, but resolving it is out of
+  scope here to keep this change reviewable.
+- Any policy enforcement based on the label's value (e.g. blocking promotion between
+  environments) — this RFC only covers defaulting and propagation of the label's value.
+
+## High-level architecture
+
+Two independent code paths need the same defaulting/propagation logic:
+
+```
+Direct API create:
+  client → go/api/handler.Create() → [NEW] setDefaultEnvironmentLabel(obj) → persist
+
+Scheduled trigger fire:
+  cron trigger → generatePipelineRunRequest() → [REFACTORED] defaultOrPropagateEnvironmentLabel(triggerRun.Labels, newLabels) → CreatePipelineRun
+```
+
+Both paths call into one shared helper and one shared constant, instead of the current situation
+where the API path has no defaulting at all and the worker path inlines its own hardcoded
+fallback.
+
+## APIs and CRDs
+
+No proto/CRD schema changes. This RFC proposes Go-level changes only:
+
+- A single canonical `EnvironmentLabel` constant, promoted out of
+  `go/worker/workflows/trigger/cron_trigger_workflows.go:48` into a shared package (e.g. `go/api`
+  or `go/base`) so both `go/api/handler` and `go/worker` reference the same key. The duplicate
+  local constant in `go/components/triggerrun/schedule_input.go:13` is removed in favor of this
+  shared constant.
+- A new `setDefaultEnvironmentLabel(obj client.Object)` helper in `go/api/handler/handler.go`,
+  following the shape of the existing `setUpdateTimestamp` helper (`handler.go:485-497`) but with
+  **set-if-absent** semantics (never overwrites an explicit value) and gated to `PipelineRun`
+  objects specifically, called from `Create` (`handler.go:93`) alongside `setUpdateTimestamp`.
+- A shared `defaultOrPropagateEnvironmentLabel(src, dst map[string]string)` helper, extracted from
+  the existing inline logic in `generatePipelineRunRequest`
+  (`cron_trigger_workflows.go:309-313`), reused by any other trigger re-fire path (e.g. backfill)
+  that creates a new `PipelineRun` from a parent that may carry the label.
+- The default value becomes a package-level configuration point rather than a bare string
+  literal, so an operator can override it without a code change (exact configuration surface —
+  Helm value vs. ConfigMap key vs. compile-time constant — is an open question below).
+
+## Alternatives considered
+
+### Alternative A: Kubernetes-style mutating admission webhook
+
+**Pros:** Matches the community-consensus pattern used by Kubernetes generally and, per prior-art
+research, is the mechanism most OSS operators will recognize; naturally re-applies on every
+creation path without each call site needing to remember to invoke it; centralizes defaulting
+completely outside business logic.
+
+**Cons:** Michelangelo's `go/api/handler` already does inline, in-process mutation for comparable
+concerns (`setUpdateTimestamp`) rather than using the k8s admission-webhook mechanism; introducing
+a new webhook for a single label would add operational complexity (webhook deployment,
+certificate management, failure-mode handling) disproportionate to the size of this feature.
+
+**Why not chosen:** Given the existing `setUpdateTimestamp` precedent already lives inline in the
+handler, extending that established pattern is more consistent with the codebase and avoids
+introducing a new infrastructure component for this specific gap. A webhook-based approach could
+be revisited if more defaulting/policy needs accumulate.
+
+### Alternative B: Leave the `"production"` vs. no-default inconsistency as-is, document only
+
+**Pros:** Zero code risk; ships as a docs-only PR.
+
+**Cons:** Does not fix the underlying data-quality problem — `PipelineRun`s created directly via
+the API would still have no environment label, and the `"unknown"` fallback would remain the norm
+rather than the exception. Documentation alone does not change existing behavior for the
+majority of affected callers.
+
+**Why not chosen:** The problem statement is a functional gap, not merely an undocumented one;
+documentation is necessary but not sufficient (see the DX checklist below, which requires
+documentation as one of several changes, not a substitute for the code fix).
+
+## Open questions
+
+- [ ] What is the right default value, and where does an operator configure it (Helm value,
+  ConfigMap key, or a per-`Project`/`Pipeline` override)? The existing trigger-path fallback of
+  `"production"` and this RFC's motivating discussion of `"development"` disagree — this must be
+  resolved, not left as two different defaults on two different code paths.
+- [ ] Should the label be widened beyond `PipelineRun` (e.g. to `Project`/`Pipeline`/`TriggerRun`)
+  before or after this change ships? Building defaulting on a `PipelineRun`-scoped label now makes
+  a later widening a breaking rename.
+- [ ] What is the opt-out mechanism for a caller that intentionally wants no environment label
+  (as distinct from "forgot to set it")?
+- [ ] Does an already-defaulted label that a user later sets explicitly count as configuration
+  drift for the purposes of `scheduleInputHash` (`schedule_input.go:19-32`), or should defaulted
+  values be excluded from drift comparisons?
+- [ ] Is a logged/eventable signal (e.g. a Kubernetes Event) sufficient visibility when a default
+  is injected, or does this warrant a status field on `PipelineRun` itself?
+
+## Rollout strategy
+
+- **Phase 1 (this RFC's scope):** land the shared constant, the create-time defaulting helper, and
+  the refactored propagation helper, behind table-driven tests matching the conventions in
+  `go/components/triggerrun/schedule_input_test.go`. Existing `PipelineRun`s created before this
+  change are unaffected — no backfill/migration job is required, since consumers already treat an
+  absent label as `"unknown"` and will continue to do so for pre-existing objects.
+- **Migration path:** because this changes previously-unset labels going forward (not retroactively),
+  any dashboard/alert/query filtering on `pipelinerun.michelangelo/environment=unknown` should be
+  called out in release notes as a behavior change for *new* runs post-upgrade.
+- **Rollback:** the defaulting/propagation helpers are additive and can be reverted independently
+  of the `PipelineRun` create path itself; no data migration is introduced, so rollback is a
+  straightforward code revert.
+
+## References
+
+- Prior art comparison (Argo Workflows, Kubeflow Pipelines, Flyte, Kubernetes admission webhooks)
+  informing this design is available on request from the design discussion that produced this RFC.
+- Argo Workflows — Template Defaults: https://argo-workflows.readthedocs.io/en/latest/template-defaults/
+- Argo Workflows v3.5 release notes (creator-label propagation): https://terrytangyuan.github.io/2023/08/14/argo-workflows-v3.5/
+- Flyte — open feature request for default launch-plan labels: https://github.com/flyteorg/flyte/issues/5774
+- Kubernetes — Admission Webhook Good Practices: https://kubernetes.io/docs/concepts/cluster-administration/admission-webhooks-good-practices/
