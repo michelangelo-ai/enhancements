@@ -214,6 +214,10 @@ documentation as one of several changes, not a substitute for the code fix).
   of the `PipelineRun` create path itself; no data migration is introduced, so rollback is a
   straightforward code revert.
 
+## Implementation
+
+Tracked in michelangelo-ai/michelangelo#1720.
+
 ## References
 
 - Prior art comparison (Argo Workflows, Kubeflow Pipelines, Flyte, Kubernetes admission webhooks)
