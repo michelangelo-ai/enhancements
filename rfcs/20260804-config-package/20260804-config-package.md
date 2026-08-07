@@ -27,6 +27,7 @@ Michelangelo's UI is designed to be adoptable by different teams, each with diff
 - Building an override engine (slot-based registration, deep merge utilities, builder APIs). Consumers compose with standard TypeScript.
 - Auto-generating configuration from protobuf schemas. The config package is hand-maintained; protoc plugin integration is a future consideration.
 - Splitting protobuf-generated types into a separate `@michelangelo-ai/api` package. Generated types remain in `@michelangelo-ai/rpc` until a concrete consumer needs types without the transport dependency. The config package depends on `rpc` via `import type` (no runtime cost).
+- Prescribing the correct configuration of deployment approach of Michelangelo Studio. Operators can use whatever configuration works best for their deployment, including custom React components. 
 
 ## High-level architecture
 
