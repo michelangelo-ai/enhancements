@@ -108,20 +108,31 @@ at process startup rather than read from a package-level global, so `setDefaultE
 and `defaultOrPropagateEnvironmentLabel` both take the configured default as a parameter.
 
 If the operator sets no value, the packaged Helm chart ships a default-of-defaults of
-`"unknown"` — deliberately **not** a guessed real environment value (not `"development"`, not
-`"production"`). Two properties make `"unknown"` the right zero-config default:
+`"unspecified"` — deliberately **not** a guessed real environment value (not `"development"`, not
+`"production"`), and deliberately **not** `"unknown"` either. Those are two different states:
 
-1. **It's already this codebase's convention for "value not determined."** `getEnvironment()`
-   (`go/components/pipelinerun/controller.go:635-641`) and every sibling extractor in that file
-   already return the literal string `"unknown"` when a value can't be derived. Using it here
-   means the *persisted* label and the *read-time* fallback finally agree, instead of one saying
-   absent and the other computing `"unknown"` separately.
-2. **It keeps every `PipelineRun` groupable/filterable for metrics and dashboards** — the original
+- `"unknown"` already means, throughout this codebase, "the system could not determine a value" —
+  `getEnvironment()` (`go/components/pipelinerun/controller.go:635-641`) and every sibling
+  extractor in that file return it as a read-time fallback for genuinely missing/legacy data
+  (e.g. a `PipelineRun` created before this label existed). That meaning is unchanged by this RFC.
+- `"unspecified"` means something different: the new defaulting/propagation logic *did* run, and
+  *did* produce a value — the operator simply hasn't configured a real one yet. Reusing
+  `"unknown"` for this would conflate "we don't know" with "nobody's configured it," which muddies
+  both signals for anyone querying or dashboarding on this field later — a distinction called out
+  during RFC review.
+
+Two properties make `"unspecified"` the right zero-config default for the *new* write path:
+
+1. **It keeps every `PipelineRun` groupable/filterable for metrics and dashboards** — the original
    problem this RFC set out to fix — without the correctness risk of guessing a real environment.
    An unlabeled run silently defaulting to `"production"` risks being swept into
    production-scoped cost/policy/promotion logic it was never meant to be part of; guessing
-   `"development"` is safer but is still a guess. `"unknown"` makes "we don't know" a first-class,
-   queryable state instead of forcing a pick between two real environments.
+   `"development"` is safer but is still a guess. `"unspecified"` makes "no configured default"
+   a first-class, queryable state, distinct from both a real environment and from "unknown."
+2. **It keeps the existing `"unknown"` read-time fallback meaningful.** Pre-existing objects (or
+   any future path that doesn't route through this new defaulting logic) still surface as
+   `"unknown"` via `getEnvironment()`, unchanged — so `"unknown"` in a dashboard continues to mean
+   what it always meant, rather than being diluted by every zero-config install's new writes.
 
 This RFC scopes the configuration to a single, global, per-deployment value (one Helm value per
 install), not a per-namespace or per-project override. The motivating scenario — different
@@ -167,8 +178,9 @@ documentation as one of several changes, not a substitute for the code fix).
 
 - [x] ~~What is the right default value, and where does an operator configure it?~~ **Resolved:**
   a single global `apiserver.pipelineRunDefaults.environment` Helm value per deployment; if unset,
-  the zero-config default is the sentinel `"unknown"` (matching this codebase's existing
-  not-determined convention), never a guessed real environment. See "Default value configuration"
+  the zero-config default is the sentinel `"unspecified"` — deliberately distinct from the
+  pre-existing `"unknown"` read-time fallback (`getEnvironment()`), which still means "the system
+  couldn't determine a value" and is unchanged by this RFC. See "Default value configuration"
   above. Per-namespace/per-project override is explicitly deferred to a follow-up RFC.
 - [ ] Should the label be widened beyond `PipelineRun` (e.g. to `Project`/`Pipeline`/`TriggerRun`)
   before or after this change ships? Building defaulting on a `PipelineRun`-scoped label now makes
@@ -190,12 +202,14 @@ documentation as one of several changes, not a substitute for the code fix).
 - **Migration path — real, called-out behavior change on one path:** the trigger re-fire path
   (`generatePipelineRunRequest` in `cron_trigger_workflows.go:309-313`) currently hardcodes
   `"production"` as its fallback when the firing object has no label. After this change, an
-  unconfigured install's trigger-fired `PipelineRun`s will carry `"unknown"` instead of
+  unconfigured install's trigger-fired `PipelineRun`s will carry `"unspecified"` instead of
   `"production"` in that same no-label case. This should be called out explicitly in release
   notes: any dashboard/alert/query that assumed unlabeled trigger-fired runs were `"production"`
   needs to either configure `apiserver.pipelineRunDefaults.environment: "production"` to preserve
-  today's behavior, or update its filters to account for `"unknown"`. The direct-API-create path
-  has no equivalent prior default, so its behavior there is purely additive.
+  today's behavior, or update its filters to account for `"unspecified"`. The direct-API-create
+  path has no equivalent prior default, so its behavior there is purely additive. Note that
+  `"unspecified"` is a new value, distinct from the pre-existing `"unknown"` read-time fallback —
+  queries that already filter on `"unknown"` are unaffected by this change.
 - **Rollback:** the defaulting/propagation helpers are additive and can be reverted independently
   of the `PipelineRun` create path itself; no data migration is introduced, so rollback is a
   straightforward code revert.
