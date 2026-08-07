@@ -93,9 +93,8 @@ No proto/CRD schema changes. This RFC proposes Go-level changes only:
   that creates a new `PipelineRun` from a parent that may carry the label.
 - The default value is **operator-configurable**, not a bare string literal or compile-time
   constant — see the new "Default value configuration" subsection below. Different deployments of
-  this platform have already expressed wanting different out-of-the-box defaults (one wants
-  unlabeled runs to default to `"development"`, another to `"production"`), which rules out a
-  single hardcoded value for everyone.
+  this platform have already expressed wanting different out-of-the-box defaults, which rules out a
+  single hardcoded real-environment value for everyone.
 
 ### Default value configuration
 
@@ -109,9 +108,20 @@ at process startup rather than read from a package-level global, so `setDefaultE
 and `defaultOrPropagateEnvironmentLabel` both take the configured default as a parameter.
 
 If the operator sets no value, the packaged Helm chart ships a default-of-defaults of
-`"development"` — the conservative failure mode, since an unlabeled run silently defaulting to
-`"production"` risks it being swept into production-scoped cost/policy/promotion logic, whereas
-defaulting to `"development"` fails safe.
+`"unknown"` — deliberately **not** a guessed real environment value (not `"development"`, not
+`"production"`). Two properties make `"unknown"` the right zero-config default:
+
+1. **It's already this codebase's convention for "value not determined."** `getEnvironment()`
+   (`go/components/pipelinerun/controller.go:635-641`) and every sibling extractor in that file
+   already return the literal string `"unknown"` when a value can't be derived. Using it here
+   means the *persisted* label and the *read-time* fallback finally agree, instead of one saying
+   absent and the other computing `"unknown"` separately.
+2. **It keeps every `PipelineRun` groupable/filterable for metrics and dashboards** — the original
+   problem this RFC set out to fix — without the correctness risk of guessing a real environment.
+   An unlabeled run silently defaulting to `"production"` risks being swept into
+   production-scoped cost/policy/promotion logic it was never meant to be part of; guessing
+   `"development"` is safer but is still a guess. `"unknown"` makes "we don't know" a first-class,
+   queryable state instead of forcing a pick between two real environments.
 
 This RFC scopes the configuration to a single, global, per-deployment value (one Helm value per
 install), not a per-namespace or per-project override. The motivating scenario — different
@@ -156,8 +166,9 @@ documentation as one of several changes, not a substitute for the code fix).
 ## Open questions
 
 - [x] ~~What is the right default value, and where does an operator configure it?~~ **Resolved:**
-  a single global `apiserver.pipelineRunDefaults.environment` Helm value per deployment, defaulting
-  to `"development"` if unset when not otherwise specified. See "Default value configuration"
+  a single global `apiserver.pipelineRunDefaults.environment` Helm value per deployment; if unset,
+  the zero-config default is the sentinel `"unknown"` (matching this codebase's existing
+  not-determined convention), never a guessed real environment. See "Default value configuration"
   above. Per-namespace/per-project override is explicitly deferred to a follow-up RFC.
 - [ ] Should the label be widened beyond `PipelineRun` (e.g. to `Project`/`Pipeline`/`TriggerRun`)
   before or after this change ships? Building defaulting on a `PipelineRun`-scoped label now makes
@@ -175,11 +186,16 @@ documentation as one of several changes, not a substitute for the code fix).
 - **Phase 1 (this RFC's scope):** land the shared constant, the create-time defaulting helper, and
   the refactored propagation helper, behind table-driven tests matching the conventions in
   `go/components/triggerrun/schedule_input_test.go`. Existing `PipelineRun`s created before this
-  change are unaffected — no backfill/migration job is required, since consumers already treat an
-  absent label as `"unknown"` and will continue to do so for pre-existing objects.
-- **Migration path:** because this changes previously-unset labels going forward (not retroactively),
-  any dashboard/alert/query filtering on `pipelinerun.michelangelo/environment=unknown` should be
-  called out in release notes as a behavior change for *new* runs post-upgrade.
+  change are unaffected — no backfill/migration job is required.
+- **Migration path — real, called-out behavior change on one path:** the trigger re-fire path
+  (`generatePipelineRunRequest` in `cron_trigger_workflows.go:309-313`) currently hardcodes
+  `"production"` as its fallback when the firing object has no label. After this change, an
+  unconfigured install's trigger-fired `PipelineRun`s will carry `"unknown"` instead of
+  `"production"` in that same no-label case. This should be called out explicitly in release
+  notes: any dashboard/alert/query that assumed unlabeled trigger-fired runs were `"production"`
+  needs to either configure `apiserver.pipelineRunDefaults.environment: "production"` to preserve
+  today's behavior, or update its filters to account for `"unknown"`. The direct-API-create path
+  has no equivalent prior default, so its behavior there is purely additive.
 - **Rollback:** the defaulting/propagation helpers are additive and can be reverted independently
   of the `PipelineRun` create path itself; no data migration is introduced, so rollback is a
   straightforward code revert.
