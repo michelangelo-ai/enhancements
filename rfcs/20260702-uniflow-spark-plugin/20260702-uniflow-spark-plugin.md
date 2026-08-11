@@ -1,6 +1,6 @@
 # RFC-20260702-uniflow-spark-plugin: `run_spark_job()` — Custom Spark Entrypoints Without a Wrapped Python Task
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Author(s):** @sallycr
 - **Created:** 2026-07-02
 
@@ -218,3 +218,8 @@ Purely additive — no phasing, feature flags, or migration needed:
 
 - [michelangelo-ai/michelangelo#1463](https://github.com/michelangelo-ai/michelangelo/issues/1463) — Implement `SparkPlugin` (tracking issue for this RFC's implementation).
 - [michelangelo-ai/michelangelo#1457](https://github.com/michelangelo-ai/michelangelo/issues/1457) — `SparkApplication.Type` is hardcoded to `Python` regardless of entrypoint language (`go/components/spark/job/client/client.go:54`). Found while sandbox-validating the `core/lib/spark` builtins this RFC's implementation depends on; doesn't currently break execution (the operator falls back to `--class` when `main_class` is set) but the declared CRD type is wrong for jar/Scala entrypoints.
+
+## Implementation tracking
+
+- **Parent Tracking Issue:** [michelangelo-ai/michelangelo#1463](https://github.com/michelangelo-ai/michelangelo/issues/1463)
+- **Note:** Implementation deferred pending a new prototype PR — RFC content may be revised before work begins.
