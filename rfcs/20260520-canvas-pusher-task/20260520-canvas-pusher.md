@@ -1,6 +1,6 @@
 # RFC-20260520-canvas-pusher: Canvas Pusher — Phase 1 Open Source Design
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Author(s):** kenns29, sallycr
 - **Created:** 2026-05-20
 
@@ -185,3 +185,7 @@ PYTHONPATH=. poetry run python \
 - [MLflow Model Registry docs](https://mlflow.org/docs/latest/model-registry.html)
 - [Vertex AI Model Registry docs](https://cloud.google.com/vertex-ai/docs/model-registry/introduction)
 - [PluginRegistry extension pattern — similar: pytest plugin system](https://docs.pytest.org/en/stable/how-to/plugins.html)
+
+## Implementation tracking
+
+- **Parent Tracking Issue:** [michelangelo-ai/michelangelo#1778](https://github.com/michelangelo-ai/michelangelo/issues/1778)
