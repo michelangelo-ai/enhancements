@@ -1,6 +1,6 @@
 # RFC-20260630: Michelangelo LLM Gateway — Pluggable Manager Design
 
-- **Status:** Draft
+- **Status:** Approved
 - **Author(s):** @sally-lee
 - **Created:** 2026-06-30
 
