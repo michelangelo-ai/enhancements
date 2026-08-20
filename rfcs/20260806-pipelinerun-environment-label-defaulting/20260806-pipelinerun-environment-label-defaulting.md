@@ -1,6 +1,6 @@
 # RFC-20260806-pipelinerun-environment-label-defaulting: Default and Propagate the PipelineRun Environment Label
 
-- **Status:** Draft
+- **Status:** Approved
 - **Author(s):** @sallycr
 - **Created:** 2026-08-06
 - **Internal ERD:** N/A
