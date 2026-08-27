@@ -31,7 +31,7 @@ Michelangelo's multi-cluster layer adds a seventh, platform-specific gap: **capa
 
 Queueing, priority, and quota are table stakes for a multi-tenant batch platform. Kubernetes [Kueue](https://kueue.sigs.k8s.io/) is the CNCF-standard job queueing layer and ships a first-class RayCluster integration — building admission control ourselves would duplicate it poorly. Adopting Kueue per compute cluster (Phase 1) gives immediate queueing/priority/quota, and surfacing each cluster's Kueue state to the control plane (Phase 2) turns multi-cluster assignment from "first available" into "most likely to admit quickly."
 
-The pressure is concrete for large multi-team GPU deployments (AV Labs is the first adopter driving this): the P0 rows above burn real GPU-hours today — partial starts holding idle heads on GPUs with no admission gate — and every newly onboarded team sharpens the quota and priority rows from P2 toward blocker.
+The pressure is concrete for large multi-team GPU deployments: the P0 rows above burn real GPU-hours today — partial starts holding idle heads on GPUs with no admission gate — and every newly onboarded team sharpens the quota and priority rows from P2 toward blocker.
 
 ## Goals
 
@@ -149,8 +149,7 @@ project and overrides any user-supplied `kueue.x-k8s.io/queue-name`, with a conv
 (`ma-<project>`) plus an operator override map for existing Kueue estates, and a clear dispatch-time
 failure when the resolved queue does not exist. The label contract above is unchanged by this — only the
 *writer* of the queue label moves from the Starlark plugin to the control plane, which is why Phase 1's
-plumbing is not wasted. (This approach is argued well in
-[enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19); see Alternatives.)
+plumbing is not wasted.
 
 ### Prerequisites in the current Ray path
 
@@ -163,6 +162,7 @@ absent. Until recently the k8s engine mapped that to `RAY_CLUSTER_STATE_UNKNOWN`
 controller read UNKNOWN-plus-terminal-pod-errors as FAILED and terminated the cluster — observed live on
 a Kueue-gated cluster that Kueue admitted ~1 second after creation.
 [PR #1700](https://github.com/michelangelo-ai/michelangelo/pull/1700) fixed this with a first-class
+- Prior art: [michelangelo#1129](https://github.com/michelangelo-ai/michelangelo/pull/1129), "Integration Kueue into compute cluster scheduler for ray job" — validated suspend/admit end to end on two k3d compute clusters
 non-terminal `RAY_CLUSTER_STATE_SUSPENDED` and merged; the enum is on `main`. This RFC assumes it and
 builds the queued-state reporting on top of it.
 
@@ -318,35 +318,34 @@ This was the original internal spec's design.
 **Why not chosen:** highest custom-code burden for the least upstream leverage.
 
 ### Alternative D: a `KueueJobQueue` backend behind the `JobQueue` interface
-Proposed independently in [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19), which reaches a
-similar end state through a different seam: a `KueueJobQueue` implementing the existing `JobQueue`
-interface, selected by an fx factory and an additive `scheduler_type` field on `ClusterSpec`.
+Reaches a similar end state through a different seam: a `KueueJobQueue` implementing the existing
+`JobQueue` interface, selected by an fx factory, with an additive per-cluster `scheduler_type` field on
+`ClusterSpec` declaring which clusters are Kueue-managed.
 **Pros:** uses the extension point the operator guide already advertises ("Custom Backend (e.g., Kueue,
 Volcano)"); the per-cluster declaration lives in the API where the UI and `ma cluster get` can see it,
 rather than in controllermgr config; makes mixed fleets explicit at the cluster object.
 **Cons:** the interface does not model what happens. Kueue's queue lives *on the compute cluster*, held
 as `spec.suspend`, and it cannot be relocated into a control-plane `JobQueue` because that is where the
-quota is. Tracing that design's own lifecycle, the job runs `AssignmentStrategy.Select`, gets a resolved
-queue label, and is dispatched suspended — leaving the `JobQueue` immediately. What the backend actually
-does is choose a cluster, resolve a queue name, and stamp a label: placement and mapping, not queueing.
-That work is what `AssignmentStrategy` already models, and routing it through a second `JobQueue`
-implementation also costs a proto field to carry state that config already carries.
+quota is. Trace the lifecycle: the job runs `AssignmentStrategy.Select`, gets a resolved queue label, and
+is dispatched suspended — leaving the `JobQueue` immediately. What such a backend actually does is choose
+a cluster, resolve a queue name, and stamp a label: placement and mapping, not queueing. That work is
+what `AssignmentStrategy` already models, and routing it through a second `JobQueue` implementation also
+costs a proto field to carry state that config already carries.
 **Why not chosen:** extending `AssignmentStrategy` reaches the same behavior at the interface that
-matches the decision, with no schema change. The distinction is mostly structural — both designs put
-Kueue on the compute cluster and both are opt-in — so this is a disagreement about seams, not outcomes.
-Two things that proposal argues are adopted here regardless: control-plane-resolved queue names (see the
-label contract) and the creation-budget prerequisite (see Prerequisites). Its per-cluster `scheduler_type`
-field remains a reasonable future addition if the fleet-visibility argument wins; nothing in the label
-contract forecloses it.
+matches the decision, with no schema change. The difference is mostly structural — either way Kueue runs
+on the compute cluster and the behavior is opt-in — so this is a choice of seam, not of outcome. A
+per-cluster `scheduler_type` field remains a reasonable future addition if the fleet-visibility argument
+wins on its own merits; nothing in the label contract forecloses it.
 
 ## Open questions
 
 - [ ] **Queued-state *reason* and UX.** The state itself is settled: [PR #1700](https://github.com/michelangelo-ai/michelangelo/pull/1700) merged a non-terminal `RAY_CLUSTER_STATE_SUSPENDED` (`proto/api/v2/ray_cluster.proto`), so a Kueue-held cluster is monitored rather than destroyed (see Prerequisites). What remains is narrower: SUSPENDED says "not running", not "waiting behind 40 GPUs of quota". Kueue creates a `Workload` CR per RayCluster whose status carries admission state and errors (`QuotaReserved` pending, `Inadmissible` with message) — watching those Workload CRs alongside the existing informers is the natural mechanism for reflecting a reason into the RayCluster status and from there into the UI. Should that reason land as a condition on the RayCluster, a dedicated status field, or stay a `kubectl`-level detail in Phase 1?
+- Prior art: [michelangelo#1129](https://github.com/michelangelo-ai/michelangelo/pull/1129), "Integration Kueue into compute cluster scheduler for ray job" — validated suspend/admit end to end on two k3d compute clusters
 - [ ] **WorkloadPriorityClass provisioning.** The platform forwards the priority-class label but does not provision any `WorkloadPriorityClass` objects; a label naming a missing class fails admission on that cluster. Ship a small default set (e.g. `high`/`low`), or leave entirely to operators?
 - [ ] **Headroom estimate vs autoscaling.** Resource asks use `MinInstances` per worker group, so headroom is optimistic for clusters that autoscale toward `MaxInstances`. Is min-based admission the right long-term contract, or should the strategy (and quota checks) consider max?
 - [ ] **Kueue upgrade cadence.** v0.10.x tracks k8s 0.31; when the repo bumps `k8s.io/*`, which Kueue line do we move to? The server-side pin now lives in one overridable place — the `kueue` dependency in `helm/michelangelo-compute/Chart.yaml` — so a bump is that chart pin plus the matching `sigs.k8s.io/kueue` Go-module bump.
 - [ ] **`waitForPodsReady`.** Enabling Kueue's all-or-nothing startup (evict and requeue when pods don't all become ready within a timeout) closes two gaps at once: the quota-admission-vs-true-gang-placement gap, and **crashlooping jobs holding GPUs** — on timeout (covering both `ImagePullBackOff`, never Ready, and `CrashLoopBackOff`, loses Ready) Kueue suspends the job, deletes its pods, returns quota to the ClusterQueue, and requeues with exponential backoff. What timeout/backoff defaults are safe for ML workloads with long image pulls? Note the blast radius when deciding: `waitForPodsReady` is Kueue **installation-wide** `Configuration`, not a per-ClusterQueue setting (a per-queue override is only an open upstream request, [kueue#7542](https://github.com/kubernetes-sigs/kueue/issues/7542)), so enabling it governs *every* Kueue-managed workload on that compute cluster, not only Michelangelo's. On a shared cluster that is an operator-level decision, and the operator guide must say so.
-- [ ] **RayJob integration — and whether it is reachable at all on the pinned line.** AV Labs runs RayJobs as well as RayClusters, and `ray.io/rayjob` is an upstream chart default this RFC deliberately switches off — so enabling it is un-narrowing the `frameworks` list plus forwarding the two Kueue labels through the RayJob mapping path. Until both land a RayJob carries no queue label and Kueue would ignore it anyway, so the two halves must ship together. There is a prior question, though: even with both, Michelangelo's RayJobs set `spec.clusterSelector`, and current Kueue skips such RayJobs outright ([kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218)) — so on a recent Kueue the fast-follow buys nothing, because gating the RayCluster already gated the capacity. Worse on the pinned line: that skip postdates 0.10, so on 0.10.6 un-narrowing may instead gate our RayJobs as *independent* workloads, double-counting quota their RayCluster already reserved or stranding them behind quota that never frees. Phase 1's test plan should assert the actual 0.10.6 behavior before anyone flips this. Is RayJob gating worth wanting once the RayCluster is gated, and if so does it justify moving the pin (see Kueue upgrade cadence)?
+- [ ] **RayJob integration — and whether it is reachable at all on the pinned line.** Deployments that run RayJobs alongside RayClusters may want the same admission story for both, and `ray.io/rayjob` is an upstream chart default this RFC deliberately switches off — so enabling it is un-narrowing the `frameworks` list plus forwarding the two Kueue labels through the RayJob mapping path. Until both land a RayJob carries no queue label and Kueue would ignore it anyway, so the two halves must ship together. There is a prior question, though: even with both, Michelangelo's RayJobs set `spec.clusterSelector`, and current Kueue skips such RayJobs outright ([kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218)) — so on a recent Kueue the fast-follow buys nothing, because gating the RayCluster already gated the capacity. Worse on the pinned line: that skip postdates 0.10, so on 0.10.6 un-narrowing may instead gate our RayJobs as *independent* workloads, double-counting quota their RayCluster already reserved or stranding them behind quota that never frees. Phase 1's test plan should assert the actual 0.10.6 behavior before anyone flips this. Is RayJob gating worth wanting once the RayCluster is gated, and if so does it justify moving the pin (see Kueue upgrade cadence)?
 - [ ] **Quota sizing inputs.** Two facts operators need when setting `nominalQuota`, both currently undocumented: the log-collector sidecar (100m CPU / 128Mi, when log persistence is enabled) is counted *inside* the gated pod sets, on the head and every worker; the RayJob submitter pod runs *outside* Kueue quota entirely. Should the operator guide carry a worked sizing example, or is stating both facts sufficient?
 - [ ] **Per-SKU ResourceFlavor taxonomy.** Should the platform ship flavors for common GPU SKUs (e.g. A100, L40S, H100) with fallback ordering inside the default ClusterQueue, or leave flavor design entirely to operators? Shipping defaults makes "run on A100s, fall back to L40S" declarative but couples the platform to a hardware catalog.
 
@@ -357,14 +356,12 @@ contract forecloses it.
 - **Phase 2:** per-cluster Kueue clientset + informer cache; `KueueAwareAssignmentStrategy`; multi-cluster sandbox; `multi-cluster-kueue-assignment.md` docs. Also the point at which queue selection moves from the pipeline author to the control plane (project → LocalQueue resolution), which is a **requirement** once a cluster carries more than one LocalQueue — see the label contract.
 - **Feature flag:** `scheduler.assignmentStrategy` defaults to `cluster_only`; `kueue_aware` is strictly opt-in. Rollback = unset the flag (assignment reverts instantly; Phase 1 admission continues unaffected).
 - **Kueue-less clusters:** never fail registration; they are skipped by `kueue_aware` and fully served by `cluster_only`.
-- **Production clusters:** the sandbox flow is the reference implementation; production compute clusters (e.g. AV Labs on OKE) install the same `michelangelo-compute` chart through their own provisioning pipelines, overriding `kueueQueues.*` values (quotas sized to real capacity, plus queue names/namespaces as needed).
+- **Production clusters:** the sandbox flow is the reference implementation; production compute clusters install the same `michelangelo-compute` chart through their own provisioning pipelines, overriding `kueueQueues.*` values (quotas sized to real capacity, plus queue names/namespaces as needed).
 - **Implementation mapping:** landed as a six-PR stack — (0) `helm/michelangelo-compute` chart (KubeRay operator subchart + `ray-manager` RBAC) replacing the sandbox's raw manifests, (1) Kueue subchart + chart-templated default queues via the two-phase install, (2) label plumbing end-to-end + Phase 1 docs, (3) per-cluster clientset + informer cache, (4) `kueue_aware` strategy + config flag, (5) multi-cluster sandbox with per-cluster quota overrides + Phase 2 docs.
 
 ## References
 
-- Requirements source: [Batch Job Scheduler Requirements for AV Labs](./Batch%20Job%20Scheduler%20Requirements%20for%20AV%20Labs.md) (problem table, Kueue solution mapping, glossary)
 - [RFC-20260805: Compute Cluster Helm Chart](../20260805-compute-cluster-helm-chart/20260805-compute-cluster-helm-chart.md) — packaging of the per-cluster install this RFC's Phase 1 rides on
-- Related proposal: [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19), "Kueue-backed job queue and gang admission for Ray and Spark workloads" (@apurvapatkeshwar) — see Alternative D; its Spark analysis (Kueue's SparkApplication integration) is the right seed for a separate RFC alongside the Planned Spark-on-K8s launch path
 - Prerequisite, merged: [michelangelo#1700](https://github.com/michelangelo-ai/michelangelo/pull/1700), non-terminal `RAY_CLUSTER_STATE_SUSPENDED`
 - Prior art: [michelangelo#1129](https://github.com/michelangelo-ai/michelangelo/pull/1129), "Integration Kueue into compute cluster scheduler for ray job" — validated suspend/admit end to end on two k3d compute clusters
 - [kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218) — Kueue skips RayJobs with `spec.clusterSelector`
