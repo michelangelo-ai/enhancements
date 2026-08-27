@@ -18,13 +18,13 @@ The compounding symptoms:
 
 - **No versioned install unit.** There is no artifact an operator can `helm install`, `helm upgrade`, diff, or roll back on a compute cluster. Upgrading means "re-run the right commands in the right order."
 - **No home for new per-cluster components.** RFC-20260731 (Kueue) adds a queueing stack to *every* compute cluster — an operator Deployment, a trimmed manager `Configuration`, and three queue custom resources with a webhook-ordering constraint. Sequencing that imperatively per cluster multiplies the fragility.
-- **Adopters fork.** AV Labs, the first production adopter, built an internal `av-compute-cluster` chart to fill exactly this gap (KubeRay + Kueue subcharts, control-plane identity RBAC, chart-templated queue objects). Every serious adopter would have to repeat that work.
+- **Adopters fork.** With no chart to install, anyone running Michelangelo on their own compute clusters ends up writing one — an umbrella chart with KubeRay and Kueue subcharts, control-plane identity RBAC, and chart-templated queue objects. That work is identical for every adopter, and none of it flows back.
 
 ## Motivation
 
 The Kueue rollout is the forcing function: RFC-20260731's Phase 1 requires a per-cluster install whose components have ordering dependencies and per-cluster configuration (quotas). Packaging them once, declaratively, is strictly cheaper than teaching the sandbox, the docs, and every adopter's provisioning pipeline the same sequence independently.
 
-The pattern is already proven: AV Labs' internal chart bootstraps their production compute clusters this way. Upstreaming an open-source equivalent removes the incentive for per-adopter forks and completes the symmetry started by RFC-20260427 — one chart per cluster role:
+The pattern is well established — an umbrella chart is how a Kubernetes platform normally ships a set of components that must be installed together, in order, with per-cluster configuration. Providing one removes the incentive for per-adopter forks and completes the symmetry started by RFC-20260427 — one chart per cluster role:
 
 | Cluster role | Chart | RFC |
 |---|---|---|
@@ -43,7 +43,7 @@ Because the sandbox provisions its compute clusters through the same chart, the 
 
 ## Non-goals
 
-- **Registration glue.** Minting the `ray-manager` token, and creating the `Cluster` CR plus the per-cluster CA/token Secrets **on the control plane**, stays in the operator guide — the same boundary AV Labs' chart draws. This boundary does *not* cleanly cover the object-storage credentials the collector sidecar consumes **on the compute side**; see Cross-cluster coupling below, which is unresolved.
+- **Registration glue.** Minting the `ray-manager` token, and creating the `Cluster` CR plus the per-cluster CA/token Secrets **on the control plane**, stays in the operator guide. This boundary does *not* cleanly cover the object-storage credentials the collector sidecar consumes **on the compute side**; see Cross-cluster coupling below, which is unresolved.
 - **The NVIDIA GPU stack.** Drivers, device plugin, and MIG tooling are cluster infrastructure (e.g. the NVIDIA GPU Operator), not chart contents.
 - **Serving/online workloads and control-plane components** — batch (Ray) only; the control plane is RFC-20260427's chart.
 - **Queueing semantics.** What Kueue does, the label contract, and the Kueue-aware scheduler are RFC-20260731's scope; this RFC covers only how the cluster-side pieces are packaged and installed.
@@ -100,22 +100,22 @@ Subcharts are declared with `condition:` flags and resolved via `--dependency-up
 - **kuberay-operator `1.4.2`** — the version the sandbox previously installed imperatively, now declared in one place.
 - **kueue `0.10.6`** (`oci://registry.k8s.io/kueue/charts`) — the latest 0.10.x patch. The 0.10 minor matches the control plane's `sigs.k8s.io/kueue` v0.10.x Go client; the `0.10.1`/`0.10.2` charts were never published to `registry.k8s.io` (see RFC-20260731, Version pinning). Note the version string carries **no `v` prefix**: the OCI registry publishes `0.10.6`, and `--version v0.10.6` fails to resolve. Declaring the pin in `Chart.yaml` is partly what retires this footgun — the imperative install it replaces asked for `v0.10.1`, a tag that is wrong on both counts. Beyond the footgun, **this pin is the chart's largest open risk — see "The Kueue pin defeats convergence" below.**
 
-#### The Kueue pin defeats convergence, and needs an exit plan
+#### The Kueue pin is in tension with the anti-fork goal, and needs an exit plan
 
-This chart's stated motivation is to remove the incentive for per-adopter forks. The pin currently
-works against that goal, and the comparison table below makes it visible: `av-compute-cluster` runs
-Kueue **0.17.x** (`v1beta2` config) while this chart ships **0.10.6** (`v1beta1`). An adopter on 0.17.x
-cannot install this chart without downgrading their queueing layer, so the fork this RFC exists to
-retire would survive it.
+This chart's stated motivation is to remove the incentive for per-adopter forks, and the pin currently
+works against that goal. Kueue's current releases are many minors ahead of 0.10 and serve `v1beta2`;
+`v1beta1` is deprecated and scheduled out. An adopter already running a recent Kueue cannot install this
+chart as-is without downgrading their queueing layer — which is exactly the situation that produces a
+fork.
 
 Three consequences worth stating rather than discovering later:
 
-1. **Behavior does not transfer between the two.** The Kueue `clusterSelector` skip for RayJobs
+1. **Behavior does not transfer across the gap.** The Kueue `clusterSelector` skip for RayJobs
    ([kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218)) postdates the 0.10 line, so
-   admission behavior validated on the internal 0.17.x install is not evidence for what 0.10.6 does.
-   RFC-20260731 carries this as an explicit Phase 1 test-plan item.
-2. **`v1beta1` is deprecated** and scheduled out in later minors, so 0.10.6 is a shrinking island. Every
-   month on it widens the eventual migration.
+   admission behavior observed on a recent Kueue is not evidence for what 0.10.6 does. RFC-20260731
+   carries this as an explicit Phase 1 test-plan item.
+2. **0.10.6 is a shrinking island.** Every month on a deprecated API version widens the eventual
+   migration rather than deferring it.
 3. **The constraint is real, not arbitrary.** The 0.10 pin is forced by the control plane, not chosen
    here: `sigs.k8s.io/kueue` v0.10.x is what builds against the repo's `k8s.io/*` v0.31 libraries and the
    vendored `ray-operator v1.2.2`. The chart cannot move alone.
@@ -124,10 +124,10 @@ Three consequences worth stating rather than discovering later:
 off the 0.10 line when the repo bumps `k8s.io/*` past v0.31 — the same change that unblocks the Go
 client — and the bump is then a three-line change: this `Chart.yaml` dependency, the
 `sigs.k8s.io/kueue` module pin, and the `apiVersion` in the `kueue.managerConfig` override. Client and
-server stay on one minor throughout. Until that bump, the chart documents the version gap in its README
-so adopters on a newer Kueue know to set `kueue.enabled=false` and keep their own installation, taking
-only the KubeRay operator, RBAC, and queue objects from this chart — which the existing subchart
-toggles already permit, and which is the honest interim answer for AV Labs.
+server stay on one minor throughout. Until that bump, the README documents the version gap so adopters
+on a newer Kueue know to set `kueue.enabled=false` and keep their own installation, taking only the
+KubeRay operator, RBAC, and queue objects from this chart — which the existing subchart toggles already
+permit, and which is the honest interim answer.
 
 
 ### Values interface
@@ -166,7 +166,7 @@ kueueQueues:
 
 Four contract details worth calling out:
 
-- **`kueueQueues.quota` keys derive `coveredResources`.** Adding a key both covers and quotas that resource; a workload requesting an uncovered resource stays suspended. This mirrors the internal chart's design and keeps the two lists impossible to de-sync.
+- **`kueueQueues.quota` keys derive `coveredResources`.** Adding a key both covers and quotas that resource; a workload requesting an uncovered resource stays suspended. Deriving one list from the other keeps them impossible to de-sync.
 - **Partial quota overrides compose.** Helm deep-merges user values over defaults, so `--set kueueQueues.quota.cpu=64` (or a `-f` values file) changes CPU while memory/GPU keep chart defaults — this is the mechanism RFC-20260731's multi-cluster sandbox uses for per-cluster quotas.
 - **Dotted resource keys need escaping with `--set`.** Helm reads `.` as a path separator, so `--set kueueQueues.quota.nvidia.com/gpu=8` silently builds a nested `nvidia: {com/gpu: 8}` map and leaves the real GPU quota at its default. The accelerator key must be escaped (`--set 'kueueQueues.quota.nvidia\.com/gpu=8'`) — which is why the sandbox passes per-cluster quotas as a generated `-f` values file rather than `--set`, and why operators should prefer values files too.
 - **The `frameworks` override narrows the upstream default; it does not extend it.** Upstream's 0.10.6 chart enables ten integrations out of the box (`batch/job`, `ray.io/raycluster`, `ray.io/rayjob`, `jobset`, and six Kubeflow kinds). Setting `frameworks: ["batch/job", "ray.io/raycluster"]` therefore *disables* eight of them — deliberately, because Kueue should only gate workload kinds the platform actually plumbs the queue label for (RFC-20260731's label contract covers RayCluster only) and each enabled framework costs a webhook and controller on every compute cluster. The practical consequence: **enabling RayJob is a narrowing to undo, not a feature to add** (RFC-20260731, Open questions).
@@ -232,21 +232,22 @@ This is a name contract spanning two charts on two clusters, with the producer o
 - **Dedicated compute clusters** (`--create-compute-cluster`): every provisioned cluster gets the full chart; per-cluster `--compute-cluster-quotas` overrides ride phase 2 as a generated values file.
 - **Control plane doubling as the compute cluster** (default single-cluster sandbox): the chart installs with `kuberay-operator.enabled=false`, because the sandbox already installs the operator there with its local image imports; the chart contributes Kueue, the queue objects, and the RBAC.
 
-### Relationship to the internal `av-compute-cluster` chart
+### Design choices worth naming
 
-This chart deliberately mirrors the internal chart's shape (umbrella chart, pinned KubeRay + Kueue subcharts, quota-keyed `coveredResources`, two-phase queue gate) while diverging where the OSS platform differs:
+A few shapes in the values interface are deliberate rather than incidental, and are the places most
+likely to change as the platform grows:
 
-| Aspect | `av-compute-cluster` (internal) | `michelangelo-compute` (this RFC) | Why the difference |
-|---|---|---|---|
-| Control-plane identity | `ma-job-controller` SA + upstream `edit` ClusterRole + Ray ClusterRole, **plus a token Secret** the bootstrap copies to the management cluster | `ray-manager` SA + one explicit ClusterRole; no token Secret template | The OSS registration guide creates the token during registration, and sandbox k3d clusters authenticate via kubeconfig. One explicit role keeps the OSS grant auditable. Token Secret is an Open question. |
-| Kueue pin | 0.17.x (`v1beta2` config) | 0.10.6 (`v1beta1` config) | The OSS control plane's Go client is `sigs.k8s.io/kueue` v0.10.x; client and server stay on one minor (RFC-20260731). **This row blocks adoption rather than merely differing** — see "The Kueue pin defeats convergence" above. |
-| Managed frameworks | `ray.io/raycluster` + `ray.io/rayjob` only | `batch/job` + `ray.io/raycluster` | RFC-20260731 keeps the upstream `batch/job` default and defers RayJob as a fast-follow. |
-| Queue targeting | `default` LocalQueue per workload namespace; `LocalQueueDefaulting` admits unlabeled workloads | single LocalQueue; the control plane always stamps `kueue.x-k8s.io/queue-name` (default `"default"`) | The OSS jobs client owns label defaulting end-to-end (RFC-20260731's label contract); `LocalQueueDefaulting` is not enabled on the 0.10 line. |
-| Workload namespaces | `workloadNamespaces` list + optional namespace creation | one `localQueueNamespace` value | The OSS control plane creates Ray resources in a single fixed namespace today; multi-namespace is an Open question. |
-| Quota defaults | inert `"0"` quotas; a generator script sizes values from live node capacity | usable sandbox defaults (cpu 16 / memory 32Gi / gpu 4) | The OSS chart must admit workloads out-of-the-box in a sandbox; production installs override `kueueQueues.quota`. |
-| GPU stack | NOTES-only guidance behind a `gpu.enabled` toggle | out of scope | Same boundary (NVIDIA stack is cluster infrastructure); install-notes guidance deferred. |
-
-Convergence on the first, fourth, and fifth rows is expected as the Kueue pin advances and multi-namespace workloads land — the values schema was chosen so those become additive changes. The second row is the one that must actually be closed for this chart to retire the fork, and it is gated on the control plane's `k8s.io/*` bump rather than on anything in the chart.
+- **One explicit `ray-manager` ClusterRole**, rather than binding an upstream aggregate role such as
+  `edit`. The grant a compute cluster hands the control plane should be readable in one file and
+  auditable by the operator installing it.
+- **A single LocalQueue, with the control plane always stamping the queue label.** Label defaulting
+  lives in the jobs client (RFC-20260731's label contract) rather than relying on Kueue-side defaulting,
+  which is not available on the pinned 0.10 line in any case.
+- **One `localQueueNamespace`**, because the control plane creates Ray resources in a single fixed
+  namespace today. Multi-namespace is an Open question, and the schema is designed to grow into it.
+- **Quota defaults that actually admit** (cpu 16 / memory 32Gi / gpu 4) so a fresh sandbox runs a Ray
+  workload without tuning. Production installs are expected to override `kueueQueues.quota` with values
+  sized to real capacity — inert or zero defaults would make the sandbox path silently non-functional.
 
 ## APIs and CRDs
 
@@ -266,7 +267,7 @@ No new CRDs, protos, or service APIs. The chart's public surface is:
 ### Alternative B: no umbrella chart — document the upstream charts plus a tiny RBAC-only chart
 **Pros:** minimal code owned; upstream charts consumed directly.
 **Cons:** operators hand-compose three installs with an ordering constraint between two of them; no single version pin ties "a Michelangelo compute cluster" together; the queue objects and manager `Configuration` still need to live somewhere, which recreates the umbrella chart in documentation form.
-**Why not chosen:** the composition and its ordering *are* the product; an umbrella chart is the standard Helm mechanism for exactly this (and is what the internal chart converged on independently).
+**Why not chosen:** the composition and its ordering *are* the product; an umbrella chart is the standard Helm mechanism for exactly this.
 
 ### Alternative C: fold compute-side objects into `helm/michelangelo`
 **Pros:** one chart to maintain.
@@ -281,8 +282,8 @@ No new CRDs, protos, or service APIs. The chart's public surface is:
 ## Open questions
 
 - [ ] **Chart publishing.** The chart installs from a repo checkout today. Publish to an OCI registry (e.g. GHCR) and Artifact Hub? And what chart-version cadence relative to `appVersion` — the same question RFC-20260427 left open for the control-plane chart; the two should get one answer.
-- [ ] **Token Secret template.** The internal chart renders the control-plane identity's token `Secret` so bootstrap can copy credentials off the cluster. Should `rayManager` grow an optional `createTokenSecret` to shorten the registration guide, or does the token belong strictly to the registration flow?
-- [ ] **Multi-namespace workloads.** When the control plane can create Ray resources in more than one namespace, adopt the internal chart's `workloadNamespaces` list (LocalQueue per namespace, optional namespace creation)? This also becomes the natural home for RFC-20260731's Phase 2 per-project queues: once the control plane resolves a project to a LocalQueue, the chart must be able to render more than one, and `kueueQueues` becomes a list rather than a single object. Worth designing the values schema for that now, since it is a breaking shape change later.
+- [ ] **Token Secret template.** Registration needs the `ray-manager` ServiceAccount's token copied to the control plane, which today is a manual step in the operator guide. Should `rayManager` grow an optional `createTokenSecret` that renders the `Secret` so bootstrap can read it off the cluster, or does the token belong strictly to the registration flow?
+- [ ] **Multi-namespace workloads.** When the control plane can create Ray resources in more than one namespace, grow a `workloadNamespaces` list (LocalQueue per namespace, optional namespace creation)? This also becomes the natural home for RFC-20260731's Phase 2 per-project queues: once the control plane resolves a project to a LocalQueue, the chart must be able to render more than one, and `kueueQueues` becomes a list rather than a single object. Worth designing the values schema for that now, since it is a breaking shape change later.
 - [ ] **Kueue pin exit criteria.** The proposed trigger above (move when the repo bumps `k8s.io/*` past v0.31) is a proposal, not a decision. Do maintainers accept it, and does anything else force the bump sooner — for example an adopter blocked on `v1beta2`, or the RayJob `clusterSelector` behavior differing on 0.10.6?
 - [ ] **Who owns the object-storage credentials Secret?** Should the chart template it (defaulting the name to controllermgr's `<release>-object-storage-credentials`, accepting the cross-chart name coupling), should controllermgr stop defaulting the name and require it be set per cluster, or should log persistence default to off for multi-cluster installs? See Cross-cluster coupling — as it stands, a dedicated compute cluster cannot start a Ray pod with default settings.
 - [ ] **Compute-cluster observability.** The chart installs two controllers that export Prometheus metrics (`kueue-controller-manager`, `kuberay-operator`), but nothing on a compute cluster scrapes them, and queue-state visibility today is `kubectl get/describe clusterqueue`. Should the chart ship ServiceMonitors behind a `metrics.serviceMonitor.enabled` toggle, or does per-cluster monitoring belong entirely to the operator's own stack?
@@ -323,4 +324,3 @@ Draining first (`kubectl get workload -A` empty) is the safe order for the botto
 - Operator guide: `docs/operator-guides/setup/register-a-compute-cluster-to-michelangelo-control-plane.md`
 - [kuberay-helm](https://github.com/ray-project/kuberay-helm) (kuberay-operator subchart)
 - [Kueue installation](https://kueue.sigs.k8s.io/docs/installation/) (subchart: `oci://registry.k8s.io/kueue/charts/kueue`)
-- AV Labs' internal `av-compute-cluster` chart (design reference; requirements context in [Batch Job Scheduler Requirements for AV Labs](../20260731-kueue-integration/Batch%20Job%20Scheduler%20Requirements%20for%20AV%20Labs.md))
