@@ -156,6 +156,60 @@ proto option (see Non-goals). Public interface changes:
   `go/cmd/controllermgr/main.go`. Both binaries must agree on this list — there is no shared source
   of truth beyond keeping the two literals in sync by hand (see Open questions).
 
+## K8s-native semantics that no longer apply
+
+Because etcd/k8s is never involved for an opted-in kind, a few things that are normally free from the
+k8s API server have to be examined case by case. Split into what's genuinely gone versus what's still
+required but for a different reason:
+
+**Genuinely gone — not needed, not replaced:**
+- **RBAC via k8s** (`SubjectAccessReview` scoped to the CRD resource) — there's no k8s object to
+  authorize against. `apiHandler`'s own auth module (`go/auth`) becomes the sole enforcement point,
+  same as it already is for every non-etcd-native concern today.
+- **Generation / `status.observedGeneration` drift detection** — k8s normally auto-increments
+  `.metadata.generation` on every spec change so a controller can tell "have I reconciled the latest
+  spec yet." Moot here by construction: an opted-in kind has no controller (that's the point of this
+  mode), so there's nothing to compare `generation` against `observedGeneration` for.
+- **OwnerReferences-driven garbage collection** — confirmed as real, active usage elsewhere in this
+  codebase (`go/components/pipelinerun/cascade_test.go`: `Pipeline` owns `PipelineRun`/`TriggerRun` via
+  ownerReferences, cascade-deleted by k8s GC). An opted-in kind cannot rely on this; if a future
+  MySQL-primary kind ever needs parent→child cascade delete, it has to be implemented explicitly in
+  `apiHandler`, not inherited from k8s.
+- **Admission webhooks** (mutating/validating, registered against the CRD) — bypassed entirely. This
+  is already called out as an open question below (`ValidationHandler` must cover 100% of what a
+  webhook would have enforced).
+- **`kubectl get/describe/edit`** on the kind — the CRD *schema* is still registered in k8s
+  (`crd.SyncCRDs` installs it unconditionally for every kind in `v2pb.YamlSchemas`, MySQL-primary or
+  not), so `kubectl` recognizes the kind, but no instances ever appear:
+  `kubectl get metric.michelangelo.api -A` returns empty even while real rows exist in MySQL. This is
+  a real operational-UX loss for on-call/debugging workflows built around kubectl; `mactl` (which goes
+  through the apiserver's own API, not the k8s API server) is the correct tool for these kinds
+  instead.
+
+**Still required — but as MySQL's own bookkeeping, not a k8s artifact:** confirmed against the actual
+`metric` table schema, which has three `NOT NULL` columns with no default:
+```sql
+CREATE TABLE IF NOT EXISTS `metric` (
+    `uid`         VARCHAR(255)      NOT NULL,  -- PRIMARY KEY
+    `res_version` BIGINT UNSIGNED   NOT NULL,
+    `create_time` DATETIME          NOT NULL,
+    ...
+    PRIMARY KEY (`uid`),
+    KEY `metric_namespace_name` (`namespace`, `name`),
+```
+- **UID** is the literal `PRIMARY KEY` of the row — `namespace`/`name` is only a secondary index used
+  to resolve to a UID. This is unconditionally required, not a k8s convention being cargo-culted.
+- **CreationTimestamp** (`create_time`) is `NOT NULL` — MySQL needs a real value, independent of
+  whether k8s ever sees the object.
+- **ResourceVersion** (`res_version`) is also `NOT NULL`, and easy to mistake for a k8s-only concept
+  since it originates from `.metadata.resourceVersion` — but it's not gone, it's repurposed as
+  `directFullUpdate`'s own optimistic-concurrency token (`SELECT ... FOR UPDATE`, compare incoming RV
+  to `storedRV`, reject on mismatch, else write `storedRV + 1`). Drop it and two concurrent
+  `UpdateMetric` calls can silently clobber each other — a MySQL-row correctness concern that exists
+  whether or not etcd is anywhere in the picture. This is the field the initial implementation missed
+  seeding on `Create` (see Rollout strategy — verification), causing every first insert to fail with
+  MySQL error 1366 against the `NOT NULL BIGINT UNSIGNED` column.
+
 ## Alternatives considered
 
 ### Alternative A: Extend `ResourceDescriptor.immutable`-style proto option
@@ -233,6 +287,58 @@ explicitly as an open question/rollout risk below rather than solved in this RFC
   straightforward code revert — no data migration needed. For any future kind, rollback after
   objects have been created in MySQL-primary mode is materially harder (see previous bullet), so
   opting a kind in should be treated as a low-reversibility decision, not a toggle.
+
+### Migration concern: a kind starts MySQL-primary, later needs a controller
+
+A realistic day-2 scenario: a kind is opted into MySQL-primary mode on day 1 because nothing
+reconciles it, objects accumulate for months, and then a real business need for a controller shows up
+(e.g. the metric-type definition needs to trigger downstream provisioning on create). Removing the
+kind from `mySQLPrimaryKinds` does **not** make this a clean toggle — it only changes the path for
+*new* `Create`/`Update` calls going forward. Every object created while the kind was MySQL-primary
+still exists only as a MySQL row; a controller (which watches etcd via `controller-runtime`
+informers) has no way to discover them. Concretely, this migration needs:
+
+1. **A reverse-direction backfill tool.** The existing `ma-backfill`-style tooling in this codebase
+   only goes etcd → MySQL (syncing etcd objects into `MetadataStorage`, used for the
+   write-once/immutable eviction pattern). Migrating a MySQL-primary kind onto etcd needs the
+   opposite: read every existing row for that kind out of MySQL and `Create` it in etcd. No such tool
+   exists today and one would need to be built.
+2. **UID preservation.** The backfill must recreate each object with its *original* UID, not a
+   freshly-assigned one — otherwise anything that recorded the original UID (external references,
+   audit logs, cross-system joins) silently breaks. Whether the k8s API server honors a
+   client-supplied UID on `Create` for a CRD (as opposed to server-assigning one, which is the
+   built-in-resource default behavior) needs to be verified before this migration is attempted.
+3. **ResourceVersion cannot be preserved.** etcd assigns its own resourceVersion from its internal
+   revision counter on write — there is no way to make an etcd object's RV equal the MySQL
+   `res_version` it's migrating from. Every backfilled object's resourceVersion resets to whatever
+   etcd assigns on that write. This is invisible to anything that only reads current state, but would
+   look like "the object was deleted and recreated" to any client naively diffing resourceVersions
+   across the migration (there are none today, per the earlier UI/watch analysis, but this should be
+   called out for any future consumer).
+4. **Coordinated flip across both binaries.** `mySQLPrimaryKinds` is duplicated in
+   `cmd/apiserver/main.go` and `cmd/controllermgr/main.go` (see Open questions above). If the two
+   binaries deploy out of order during this flip, there's a window where one binary treats the kind as
+   MySQL-primary and the other doesn't — e.g. `apiserver` already routes new `Create`s to etcd, but
+   `controllermgr`'s ingester still skips registering a reconciler for it, so nothing reconciles the
+   newly-created etcd objects until `controllermgr` catches up. This makes the existing "keep the two
+   lists in sync" concern materially higher-stakes at migration time than at initial opt-in time.
+5. **A cutover freeze window.** Without pausing writes to the kind during backfill, an `Update` that
+   lands in MySQL after the backfill already read that row would be silently lost once the kind flips
+   to etcd-primary and MySQL stops being consulted for it. The safest sequencing is: freeze writes →
+   backfill into etcd → flip the policy on both binaries → resume writes → let the existing generic
+   ingester (already unconditionally present for every non-MySQL-primary kind) start syncing the now
+   etcd-primary objects back into MySQL as a read cache, same as any other kind.
+6. **First-reconcile side effects on adopted objects.** Once a controller exists and starts watching,
+   every backfilled object triggers that controller's create-path reconcile logic for the first time —
+   even though the object may be months old from a user's perspective. Any side-effecting logic in the
+   controller's initial reconcile (e.g. sending a "new object created" notification, kicking off
+   provisioning) needs an explicit backfill/adoption mode to suppress those actions for objects that
+   are being adopted rather than genuinely created.
+
+None of this is needed for `Metric` today — it has no controller and no plan to get one — but it's
+the direct cost of the "opting in is a low-reversibility decision" line above, spelled out concretely
+rather than left as a warning. Any team opting a kind into MySQL-primary mode should treat "does this
+kind risk needing a controller later" as part of the initial decision, not something to defer.
 
 ## References
 
