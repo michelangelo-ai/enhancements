@@ -1,6 +1,6 @@
 # RFC-20260804: Configuration Package Architecture
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Author(s):** @craig-marker
 - **Created:** 2026-08-04
 
