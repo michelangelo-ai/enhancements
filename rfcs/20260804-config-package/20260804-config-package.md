@@ -202,3 +202,7 @@ No feature flags. No phased rollout. This is a structural refactor, so applicati
 - `proto/api/v2/` — v2 resource protobuf definitions
 - PR #1627 — `ConfigProvider` + `useStudioConfig()` hook
 - PR #1643 — test-utils subpath export
+
+## Implementation tracking
+
+- **Parent Tracking Issue:** [michelangelo-ai/michelangelo#2092](https://github.com/michelangelo-ai/michelangelo/issues/2092)
