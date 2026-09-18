@@ -209,98 +209,95 @@ mode doesn't satisfy the open items below.
       error-code fidelity (not just data-plane compatibility) matters. If
       not, a small compatibility shim is needed inside the existing
       `except S3Error` blocks.
+- [ ] Exact name for the new sandbox flag — `--object-store` is proposed
+      (matching the existing `--workflow` flag's naming style), but open to
+      bikeshedding at implementation time.
+- [ ] Exact soak-window length before flipping the sandbox default; two
+      minor releases with default=`minio` is proposed based on the
+      project's observed ~1-2 week release cadence and the weekly
+      floor-bump job's cadence, but could be shortened or lengthened based
+      on release-cadence changes.
 
 ## Rollout strategy
 
-The migration is staged so that no single PR is a big-bang cutover, and
-each stage is independently shippable and revertible.
+The migration ships as dual-backend support with a release-gated default
+flip, not an in-place swap — `michelangelo-examples` pins `michelangelo` via
+floor constraints (`>=`, not exact versions), so every release published
+during the rollout window must independently keep working for it. Ordering:
+**sandbox/control-plane dual-support first → Python code changes second →
+`michelangelo-examples` last**, riding its existing automation.
 
-### Stage 1 — Sandbox deployment swap (lowest risk, highest signal)
+### 1. Sandbox and control-plane dual-support
 
-Swap `python/michelangelo/cli/sandbox/resources/minio.yaml`'s Pod spec to
-run SeaweedFS's `weed server` all-in-one mode instead of `minio server`,
-adding one new `ConfigMap` for SeaweedFS's S3 identity config. The
-`minio` Service name, both NodePorts, and the `minioadmin`/`minioadmin`
-demo credentials stay byte-for-byte identical, so every other manifest that
-references the object store by Service DNS name (bucket-setup job,
-credentials secrets, other sandbox components) needs no change.
+Add a new `weed-server.yaml` + `seaweedfs-s3-config.yaml` manifest pair
+**alongside** the existing, untouched `minio.yaml` (no in-place edit), and
+add an `--object-store {minio,seaweedfs}` flag to `ma sandbox create` /
+`ma sandbox sync`, defaulting to `minio` — following the same pattern as
+the existing `--workflow {cadence,temporal}` flag. Regardless of which
+backend is selected, the `Service` object keeps the name `minio` and both
+existing NodePorts (9090, 9091), so every other manifest that references
+the object store by Service DNS name needs no change.
 
-Representative diff:
+No control-plane code change is needed: `helm/michelangelo/values.yaml`'s
+`objectStorage.endpoint` is already backend-agnostic, so "dual support"
+there is satisfied by a documentation update alone (adding SeaweedFS as a
+documented endpoint example next to the existing MinIO/S3/GCS ones).
 
-```diff
-     - name: minio
--      image: minio/minio:RELEASE.2025-05-24T17-08-30Z
-+      image: chrislusf/seaweedfs:<pinned-stable-tag>
-       imagePullPolicy: IfNotPresent
-       command:
--        - /bin/bash
-+        - /bin/sh
-         - -c
-       args:
--        - minio server /data --console-address :9090 --address :9091
-+        - >
-+          weed server -dir=/data
-+          -master.port=9333 -volume.port=8080 -filer.port=8888
-+          -s3 -s3.port=9091 -s3.config=/etc/seaweedfs/s3_config.json
-       volumeMounts:
-         - mountPath: /data
-           name: data-volume
-+        - mountPath: /etc/seaweedfs
-+          name: s3-config-volume
-   volumes:
-     - name: data-volume
-       hostPath:
-         path: /shared/minio-data
-         type: DirectoryOrCreate
-+    - name: s3-config-volume
-+      configMap:
-+        name: seaweedfs-s3-config
-```
+**Blast radius:** local dev / CI k3d sandbox only, opt-in via flag. Zero
+production impact.
 
-The Service block (name, ports, selector) is unchanged.
+### 2. Python code changes (additive only)
 
-**Blast radius:** local dev / CI k3d sandbox only. Zero production impact —
-the Helm chart's `objectStorage` section is untouched.
+Introduce a generically-named `S3StorageBackend` alias for
+`MinioStorageBackend`, while keeping the existing
+`michelangelo.lib.artifact_manager.minio_backend.MinioStorageBackend`
+import path and constructor signature permanently functional — this is the
+one hard backward-compatibility contract the whole rollout depends on, since
+a floor-pinned consumer can resolve to any release in the window. Also add
+the small `NoSuchKey` / `BucketAlreadyOwnedByYou` error-code regression test
+against the Stage-1 sandbox described in Open questions; if SeaweedFS's
+codes differ from MinIO's, patch the two `except S3Error` blocks in
+`minio_backend.py` to translate them. Dropping the `minio` PyPI SDK
+dependency (e.g. a `boto3` rewrite) is explicitly out of scope unless that
+error-code check fails — the SDK already works as a generic S3 client
+against any compatible server.
 
-**Rollback:** the sandbox's data volume is already treated as ephemeral by
-every existing teardown path; revert the manifest to the prior commit and
-re-apply.
+### 3. Release staging and default flip
 
-### Stage 2 — Client SDK compatibility verification (code change only if needed)
+Ship dual-support (§1) in the next minor release with the sandbox default
+unchanged (`minio`), announced in `CHANGELOG.md` as an opt-in preview. Soak
+for a minimum of two minor releases with default still `minio`, giving
+`michelangelo-examples`' existing weekly `bump-michelangelo-pin.yml`
+floor-bump job (gated on its own `test.yaml` CI) at least two independent
+chances to exercise dual-support code against real pipelines. Only then
+flip the sandbox default to `seaweedfs`, called out explicitly in
+`CHANGELOG.md` since sandbox users relying on the implicit MinIO default
+would otherwise be silently switched. MinIO is never force-removed as a
+selectable option — there is no forcing function to delete it, and keeping
+it costs nothing.
 
-Add a small regression test, run against the Stage-1 sandbox, exercising
-the two S3-error-code-dependent branches in `minio_backend.py`:
-`stat_object` on a missing key (expects `S3Error.code == "NoSuchKey"`) and
-`make_bucket` on an already-existing bucket (expects
-`S3Error.code == "BucketAlreadyOwnedByYou"`). If SeaweedFS returns these
-exact standard codes (expected, since both are S3-standard, not MinIO
-inventions), this stage ships as a test-only PR that becomes a permanent
-regression guard. If the codes differ, this stage additionally patches the
-two `except S3Error` blocks in `minio_backend.py` to translate the actual
-returned code.
+Before publishing any release that falls within this rollout window, gate
+it by running `michelangelo-examples`' own `test.yaml` against a
+release-candidate build (reusing that existing workflow against a
+pre-publish wheel, not a new CI system) — closing the gap where an RC could
+otherwise only be caught after a real release already went out.
 
-**Blast radius:** `minio_backend.py` (only if codes differ) plus one new
-test file. **Rollback:** revert the single file/test.
+### 4. `michelangelo-examples`, last, with zero required code changes
 
-### Stage 3 — Helm chart / production config
+`michelangelo-examples`' own `_backend.py::resolve_storage_backend()`
+already treats `MinioStorageBackend` as a generic S3-endpoint backend, and
+depends only on the import path and constructor signature that §2
+guarantees stay stable. Its weekly floor-bump automation is therefore the
+integration test for this rollout, not new automation, and needs zero
+required code changes throughout. Two optional, one-time manual cleanup
+PRs remain for later, once the floor moves past the relevant release: (a)
+switching `_backend.py`'s import to the `S3StorageBackend` name, and (b)
+dropping its own now-redundant direct `minio>=7.2,<8` dependency.
 
-Update `helm/michelangelo/values.yaml`'s `objectStorage` and
-`logPersistence` comments/examples to add SeaweedFS alongside the existing
-MinIO/S3/GCS examples. No schema or key changes — the section is already
-server-agnostic. No forced production migration: an operator running their
-own MinIO in production today is unaffected; this stage only documents
-SeaweedFS as an additional supported option.
-
-**Blast radius:** documentation/comments in one file, zero functional
-change to any rendered manifest. **Rollback:** trivial comment revert.
-
-### Stage 4 — Docs updates
-
-Update any docs page that names MinIO as *the* object store (rather than
-*an* object store) with a short callout referencing issue #672's archival
-timeline and pointing to this migration as the recommended path forward.
-
-**Blast radius:** docs/strings only. **Rollback:** trivial revert.
+**Rollback:** every stage above is independently revertible — dual-support
+via the flag default, the Python alias via reverting the single addition,
+and the default flip via a follow-up release reverting `CHANGELOG.md`'s
+announced default back to `minio`.
 
 ## References
 
