@@ -1,6 +1,6 @@
 # RFC-20260917-minio-migration: Migrate object storage from MinIO to SeaweedFS
 
-- **Status:** Draft
+- **Status:** Approved
 - **Author(s):** @sallycr
 - **Created:** 2026-09-17
 
