@@ -3,314 +3,358 @@
 - **Status:** Draft
 - **Author(s):** @dragod812
 - **Created:** 2026-07-31
+- **Revised:** 2026-10-20
 
 ---
 
+## Summary
+
+[michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985), designed in [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19), gives compute clusters opt-in Kueue admission. On a cluster marked `scheduler_type: SCHEDULER_TYPE_KUEUE`, the control plane labels each RayCluster with its project's LocalQueue, and Kueue holds the cluster suspended until quota admits it. That is enough for one cluster in a sandbox, but not for a production fleet: defects make queueing unsafe to enable, placement ignores the quota state Kueue tracks, and Spark is not covered.
+
+| Phase | This RFC decides |
+|---|---|
+| 0 | Safety fixes to the merged backend: bounded waits, one placement decision per job, project identity, Kueue read access, an accurate view of each cluster, dispatch retries |
+| 1 | Who owns each Kueue object, and the quota model |
+| 2 | The opt-in `kueue_aware` placement rule |
+| 3 | What Kueue admission requires of Spark on compute clusters |
+
+It builds on [RFC-20260805](../20260805-compute-cluster-helm-chart/20260805-compute-cluster-helm-chart.md), which packages the compute side, and on [enhancements#20](https://github.com/michelangelo-ai/enhancements/pull/20) for namespace-bound authorization. It needs no proto or CRD changes.
+
+| Term | Meaning |
+|---|---|
+| Compute cluster | A Kubernetes cluster registered through a `Cluster` CR, to which the control plane dispatches workloads |
+| Kueue-managed | A compute cluster whose `Cluster` CR sets `scheduler_type: SCHEDULER_TYPE_KUEUE` |
+| Ready (cluster) | A compute cluster whose latest health probe succeeded; distinct from a RayCluster's `READY` state |
+| LocalQueue / ClusterQueue | Kueue's namespaced queue / the cluster-scoped quota pool it feeds |
+| Assign / dispatch | Record a job's target cluster / create the job's object on that cluster |
+| Ask | What Kueue charges for a job: the sum of resource requests over every pod it creates |
+| Admission | Kueue reserving the ask and unsuspending the workload |
+
+## Background: the job path on `main`
+
+Paths are under `go/components/` unless noted.
+
+| Step | Behavior | Code |
+|---|---|---|
+| Placement | `cluster_only` returns the cluster named by the `michelangelo/cluster-affinity` label. Otherwise it returns the first entry of an unordered map of *all* registered clusters, whether ready or not, full or idle. | `jobs/scheduler/framework/cluster_only_assignment_engine.go`, `jobs/cluster/types.go` |
+| Enqueue (`jobs.scheduler.backend: kueue`) | Calls `Select` to *predict* the target. If the target is Kueue-managed: the project is the `ma/project-name` label, or else the namespace; the LocalQueue is the override, or else `ma-{project}`; the backend GETs that LocalQueue on the target. NotFound gives `Enqueued=False/KueueQueueNotFound`; any other error gives `KueueQueueCheckFailed`. Both are retried on later reconciles. | `jobs/scheduler/kueue/`, `jobs/common/utils/utils.go` |
+| Assignment | The scheduler calls `Select` *again* and assigns the job to that result. | `jobs/scheduler/scheduler.go` |
+| Dispatch | On a Kueue-managed cluster, stamps exactly one label, `kueue.x-k8s.io/queue-name`, on the RayCluster and never on RayJobs; the RayCluster goes to namespace `default`. Any create error other than AlreadyExists fails the RayCluster (`ClusterCreationFailed`). | `jobs/client/k8sengine/mapper.go`, `ray/cluster/controller.go` |
+| Waiting | While Kueue holds the RayCluster, its state is `SUSPENDED` and it carries `Queued=True/AwaitingAdmission`, restamped on every 10 s reconcile; the condition turns False only at `READY`. Meanwhile the Uniflow readiness sensor keeps spending its 1800 s creation budget, and when the budget expires it terminates the cluster. | `ray/cluster/controller.go`; `python/.../uniflow/plugins/ray/task.star`, `go/worker/plugins/ray/starlark_module.go` |
+| Cluster view | The cluster controller refreshes its cached `Cluster` only when host, port, region, zone, DC or SLA change, and each cluster's client, credentials included, is cached for the process lifetime, so a `scheduler_type` edit or a new token needs a restart. A failed health probe is discarded: an unreachable cluster stays Ready. | `jobs/cluster/`, `jobs/compute/factory.go`, `jobs/client/helper.go` |
+| Spark | The `SparkApplication` is created on the control-plane cluster, bypassing the scheduler, with the driver SA hardcoded to `spark-operator-spark`. The mapper rejects `SparkJob`, the federated client's Spark operations are stubs, and the controller recognizes three application states. | `spark/job/`, `jobs/client/` |
+
 ## Problem statement
 
-Michelangelo now has a Kueue admission backend. [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985) (merged 2026-09-22; designed in [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19) by @apurvapatkeshwar) added a `scheduler_type` field on `ClusterSpec`, a `KueueJobQueue` backend selected by `jobs.scheduler.backend: kueue`, control-plane resolution of a job's project to a LocalQueue (`ma-{project}` by convention), an allowlisted label path that stamps exactly one label — `kueue.x-k8s.io/queue-name` — on dispatched RayClusters, and a `Queued` condition while Kueue holds a cluster suspended. Per compute cluster, Kueue's RayCluster integration now delivers job-level admission and quota-level gang admission for Ray, opt-in one cluster at a time.
-
-What that leaves open is everything *around* per-cluster admission:
-
-| # | Gap | State on `main` after michelangelo#1985 | This RFC |
-|---|---|---|---|
-| 1 | **Capacity-blind multi-cluster placement.** `ClusterOnlyAssignmentStrategy` picks the first available cluster or an affinity match. With several Kueue-managed clusters, a job can be routed to a full one and queue there while another sits idle. | Unchanged. The backend *predicts* the target with the same strategy and only validates that the resolved LocalQueue exists there. | Phase 2: a `kueue_aware` assignment strategy scores clusters by live quota headroom. |
-| 2 | **Queueing still burns the 30-minute creation budget.** `DEFAULT_CREATE_CLUSTER_TIMEOUT_SECONDS` (`python/michelangelo/uniflow/plugins/ray/task.star`) becomes the readiness sensor's `ExpirationInterval` (`go/worker/plugins/ray/starlark_module.go`); a cluster held suspended for 31 minutes fails. | Unchanged. The `Queued` condition makes the wait visible but does not stop the clock. | Phase 0: split the budget at admission. |
-| 3 | **Spark is not on compute clusters at all.** The Spark job controller creates the `SparkApplication` through the controller manager's own REST config — the control-plane cluster — with a hardcoded `spark-operator-spark` service account; the k8s-engine mapper returns "spark job mapping not implemented" for `SparkJob`. No queue label, no Kueue admission, no compute-cluster placement. | Unchanged. The backend is job-type agnostic, but only the Ray mapping exists. | Phase 3: dispatch SparkJobs to the assigned compute cluster and admit them through Kueue's SparkApplication integration. |
-| 4 | **Nothing packages the compute side.** Kueue, its queue objects, the Spark Operator, and the control-plane identity are hand-installed per cluster from a guide. | The operator guide (`docs/operator-guides/jobs/kueue-scheduler-backend.md`) documents a manual `helm install` plus `kubectl apply`; `ma sandbox demo kueue` scripts the same for k3d. | Phase 1 rides on RFC-20260805's `michelangelo-compute` chart; this RFC settles *where each queue object lives*. |
-| 5 | **No priority.** The allowlist stamps one label; nothing maps `SchedulingSpec.preemptible` or a future priority field onto a Kueue `WorkloadPriorityClass`. | Deliberately out of scope in #19. | Open question, with a proposed mapping. |
-| 6 | **No hardware-aware routing defaults.** `ResourceFlavor` per SKU stays operator YAML. | Unchanged. | Non-goal; the extension path is named. |
-
-## Motivation
-
-Per-cluster admission solves the "one team exhausts the cluster" failure. It does not decide *which* cluster a job should queue on, and Michelangelo is explicitly multi-cluster: the control plane federates N registered compute clusters and already owns placement through `AssignmentStrategy`. Once two of those clusters are Kueue-managed, "first available" placement turns quota into a lottery — the job that lands on the busy cluster waits behind quota that the idle cluster has free. Surfacing each cluster's Kueue state to the control plane turns assignment into "most likely to admit quickly", and it does so at the interface the merged backend already consults, so no second seam is introduced.
-
-The same per-cluster install has to carry Spark. Michelangelo's batch story is Ray *and* Spark (`SparkTask`, `run_spark_job()` from RFC-20260702, and every example project that preprocesses with Spark before training with Ray), and Kueue upstream now admits `SparkApplication`s natively. A compute cluster stack that gates Ray but leaves Spark racing for the same nodes only moves the contention.
+| # | Problem | Consequence |
+|---|---|---|
+| P1 | **Queued time burns the Ray creation budget.** A single 1800 s deadline covers both admission and provisioning. | A job queued for 31 minutes fails, and this happens more often the deeper the queue, which is exactly when queueing is doing its job. |
+| P2 | **Placement is decided twice.** Enqueue validates the cluster its `Select` predicted, then the scheduler assigns the job to the result of its own `Select`. | The two agree only while the strategy is deterministic and the cluster set is static. Any strategy that reads live state, P4's fix included, would dispatch jobs to clusters that were never validated. |
+| P3 | **Project identity is set by the caller.** The `ma/project-name` label overrides the namespace, and nothing in OSS stamps or strips it. | Any pipeline can use another project's LocalQueues by setting one label, and so run on clusters its own project was never onboarded to. |
+| P4 | **Placement ignores capacity and readiness.** | A job can queue behind full quota on one cluster while another sits idle, or be sent to an unreachable cluster, which still reports Ready. |
+| P5 | **Kueue-managed clusters are unsafe to operate.** The `ray-manager` identity is granted `ray.io` only. Marking a cluster or rotating its token needs a controller restart. A webhook blip fails the job. Nothing packages the compute side. | The enqueue-time LocalQueue GET is denied (`KueueQueueCheckFailed`). Rollout and rollback by marking silently do nothing. Kueue's fail-closed webhook turns any brief outage into permanent job failures. Every operator assembles and configures Kueue by hand. |
+| P6 | **Spark never reaches compute clusters.** | Spark gets no placement, no queue label and no admission. |
 
 ## Goals
 
-- **Kueue-aware placement.** With `jobs.scheduler.assignmentStrategy: kueue_aware`, the control plane picks the compute cluster whose resolved LocalQueue has the most headroom for the job's full ask, falling back to today's behavior for clusters and job kinds it cannot score. Default stays `cluster_only`.
-- **Queueing never fails a job by timeout.** Time spent suspended by Kueue does not consume the Ray creation budget; the budget covers admission → readiness only.
-- **One compute-cluster stack for Ray and Spark.** Every cluster that runs Michelangelo batch workloads installs the `michelangelo-compute` chart (RFC-20260805): KubeRay operator, Spark Operator, Kueue, the control-plane identity, and the cluster's queue objects.
-- **A defined home for every queue object.** Cluster capacity (`ResourceFlavor`, `ClusterQueue`, optional `WorkloadPriorityClass` set) is chart-rendered per cluster; per-project `LocalQueue`s ship with the project definition, with `michelangelo-examples` carrying the reference layout.
-- **Spark on compute clusters, admitted by Kueue.** `SparkJob`s dispatch to the assigned compute cluster as `SparkApplication`s carrying the control-plane-resolved queue label, gated by Kueue's `sparkoperator.k8s.io/sparkapplication` integration.
-- **Zero proto or API changes.** Everything rides on the `scheduler_type` field and config surface that michelangelo#1985 added.
+- **G1 (P1):** Every wait for capacity is bounded by the control plane, provisioning keeps its own budget, and every expiry ends with cleanup and a specific reason.
+- **G2 (P2):** Each job gets one placement decision, validated on the cluster it runs on.
+- **G3 (P3):** On Kueue-managed clusters, a job uses only its own project's LocalQueues.
+- **G4 (P4):** Opt-in placement on the cluster most likely to admit the job soonest, degrading to today's order, never to an outage, when Kueue state is missing.
+- **G5 (P5):** Cluster changes take effect without a restart, brief outages fail no job, and every Kueue object has one owner.
+- **G6 (P6):** Spark on compute clusters gets the same admission contract as Ray.
+- **G7:** No proto or CRD changes. Without the Kueue backend, behavior changes only where `main` is wrong: cluster changes and failed probes take effect (0e), and transient create errors are retried (0f).
 
 ## Non-goals
 
-- **Replacing the merged admission seam.** `KueueJobQueue` and `scheduler_type` are the base this RFC builds on; the original draft's alternative seam is recorded under Alternatives, not proposed.
-- **MultiKueue** (Kueue's built-in multi-cluster dispatch) — see Alternatives.
-- **True gang placement.** Kueue provides all-or-nothing *quota admission*; after admission the kube-scheduler still binds pods individually, so workers can queue behind real node capacity if quotas overstate it. Kueue's `waitForPodsReady` is the hardening knob — deliberately not enabled by default, both because it is installation-wide rather than per-queue and because eviction is destructive for a cluster that already went ready (see High-level architecture and Open questions).
-- **Per-SKU hardware routing defaults.** The provisioned `default-flavor` is SKU-agnostic. `ResourceFlavor`s carrying node labels/taints per GPU SKU (A100 vs L40S, with in-queue fallback ordering) are the extension path via operator YAML, not shipped defaults.
-- **Gating RayJobs.** Michelangelo's Ray path creates a RayCluster and then a RayJob that targets it via `spec.clusterSelector`, and Kueue deliberately ignores such RayJobs ([kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218)). Gating the RayCluster gates everything that consumes capacity; the RayJob's submitter pod rides along outside quota. The merged mapper already stamps no queue label on RayJobs for this reason.
-- **Auto-provisioning LocalQueues** from the control plane. Queues stay operator-authored in this RFC; the control plane validates existence (as it does today) and fails visibly.
-- Kueue's borrowing / cohort / preemption features. Defaults are provisioned; operators layer these on via Kueue YAML.
-- Surfacing Kueue queue positions in the Michelangelo UI (see Open questions).
+- **Gang placement and preemption.** Kueue admits quota all-or-nothing, but the kube-scheduler still binds pods one at a time, so quotas should not exceed real capacity. Preemption stays off, because evicting a running cluster kills its job and recovery is only Uniflow's task retry.
+- **Gating RayJobs.** Michelangelo's RayJobs attach to an existing RayCluster through `clusterSelector`, and Kueue deliberately skips such RayJobs. Gating the RayCluster already gates the capacity; the submitter pod runs outside quota.
+- **Cohorts, borrowing and multi-flavor ClusterQueues.** These are operator configuration. Placement cannot compute free quota for such queues, so it ranks them by queue depth (Phase 2).
+- **Moving Spark execution to compute clusters, and per-project namespaces on them.** Each is its own RFC. Phase 3 defines only the Kueue contract the first must meet.
+- **MultiKueue, or a control-plane Kueue.** See Alternatives.
 
-## High-level architecture
+## Design
 
 ```mermaid
 flowchart LR
-    subgraph cp["Control plane cluster"]
+    subgraph cp["Control plane"]
         direction TB
-        ctrl["Job controllers<br/>RayCluster · SparkJob"]
-        kq["KueueJobQueue (michelangelo#1985)<br/>resolves project → LocalQueue,<br/>validates it exists on the target"]
-        strat["AssignmentStrategy<br/>cluster_only (default) | kueue_aware (this RFC)"]
-        cache["RegisteredClustersCache<br/>+ per-cluster KueueClusterState"]
-        ctrl --> kq
-        kq -->|"Select()"| strat
-        cache -->|"quota headroom<br/>(kueue_aware only)"| strat
+        enq["Enqueue: project → LocalQueue"]
+        sel["Assign once per job (0b)<br/>cluster_only | kueue_aware"]
+        st["Per-cluster Kueue state<br/>read-only watches"]
+        disp["Dispatch to the assigned cluster<br/>label kueue.x-k8s.io/queue-name"]
+        enq --> sel
+        st -.->|"kueue_aware (Phase 2)"| sel
+        sel -->|"assign + validate"| disp
     end
-
-    subgraph cc["Compute cluster (x N) — michelangelo-compute chart (RFC-20260805)"]
+    subgraph cc["Compute cluster × N — RFC-20260805 charts"]
         direction TB
-        kueue["Kueue<br/>ClusterQueue per cluster · LocalQueue per project"]
-        rc["rayv1.RayCluster<br/>kueue.x-k8s.io/queue-name = ma-&lt;project&gt;"]
-        sa["SparkApplication<br/>kueue.x-k8s.io/queue-name = ma-&lt;project&gt;"]
-        ops["KubeRay operator · Spark Operator"]
-        kueue -->|"admits via label"| rc
-        kueue -->|"admits via label"| sa
-        rc --> ops
-        sa --> ops
+        kq["Kueue: ClusterQueue ← LocalQueue ma-&lt;project&gt; (ns default)"]
+        w["RayCluster · SparkApplication"]
+        kq -->|"suspend until admitted"| w
     end
-
-    strat -->|"jobs client dispatches to the assigned cluster,<br/>stamping only the resolved queue label"| rc
-    strat -.->|"Phase 3"| sa
-    kueue -.->|"Kueue informers<br/>(ClusterQueue, LocalQueue, ResourceFlavor)"| cache
+    disp --> w
+    kq -.-> st
 ```
 
-### What the merged backend already does, and how this RFC composes with it
+### Phase 0 — make the merged backend safe to enable
 
-Three properties of michelangelo#1985 are load-bearing here, so they are stated rather than assumed:
+These changes are a prerequisite for marking any cluster outside a sandbox.
 
-1. **Queue selection is control-plane-owned.** The k8s engine resolves the LocalQueue from the job's project (`ma/project-name` label when stamped, otherwise the job's namespace) through `jobs.scheduler.kueue.localQueueTemplate` / `localQueueOverrides`, and `mapLabels` forwards *no* user labels to compute clusters. A pipeline cannot name a queue it does not own. This RFC keeps that contract unchanged for Ray and extends it, byte-for-byte, to Spark.
-2. **Placement is still `AssignmentStrategy`'s.** `KueueJobQueue.Enqueue` predicts the target cluster by calling `AssignmentStrategy.Select`, then checks `scheduler_type` and LocalQueue existence on that cluster. A Kueue-aware strategy therefore upgrades placement for the merged backend with no change to the backend itself — the seam @apurvapatkeshwar identified as complementary on #19 is exactly the one used.
-3. **There is no Kueue client-library coupling.** The LocalQueue existence check is a raw `GET` against `kueue.x-k8s.io/<apiVersion>` (default `v1beta2`, configurable). Phase 2's informers keep that property by reading Kueue objects through the dynamic client at the same configured `apiVersion`, so the control plane never pins a `sigs.k8s.io/kueue` Go module and the compute-side Kueue version is free to move (see Version compatibility).
+**0a. Two bounded clocks (P1).**
 
-### Prerequisite: queueing must escape the 30-minute creation budget
+| Clock | Counts | Bound | Enforced by | On expiry |
+|---|---|---|---|---|
+| Admission wait | Time waiting for admission, from creation and again from each eviction: placement waits (`Enqueued=False`) and time `SUSPENDED`. Dispatch to a non-Kueue cluster counts as admission. | `jobs.scheduler.kueue.admissionTimeout`, default `24h` | RayCluster controller | The RayCluster fails with `AdmissionTimeout`, and its compute-side object, if any, is deleted, releasing its queue position. |
+| Provisioning | Time from creation to `READY`, excluding time `SUSPENDED`, cumulative across evictions | The Uniflow task budget, default 1800 s | Uniflow readiness sensor | The task fails with the RayCluster's latest condition reason, and the RayCluster is deleted. |
 
-Two properties of the Ray path were prerequisites when this RFC was first drafted. The first — the control plane must not destroy suspended clusters — landed as the non-terminal `RAY_CLUSTER_STATE_SUSPENDED` ([michelangelo#1700](https://github.com/michelangelo-ai/michelangelo/pull/1700)), and michelangelo#1985 layers the `Queued` condition (`AwaitingAdmission` → `ClusterAdmitted`) on top of it. The second is still open and gates safe use of queueing at any depth.
+The rules behind the table:
 
-The entire create-and-wait path shares a single 1800-second budget: `DEFAULT_CREATE_CLUSTER_TIMEOUT_SECONDS = 60 * 30` in `task.star` is passed to `ray.create_cluster`, and the Go plugin assigns it to the readiness sensor's `ExpirationInterval`. On expiry the plugin terminates the cluster and fails the task. That budget was sized for *provisioning* — pulling images and starting pods — but it also covers *waiting for admission*. Left alone, a job legitimately queued behind quota for 31 minutes fails, which contradicts the central promise that jobs queue instead of failing, and it fails more often the deeper the queue — exactly when queueing is doing its job. The same constant derives `RAY_NUM_REDIS_GET_RETRIES`, the existing workaround for the absence of gang scheduling.
+- **`Queued` becomes exact.** It is True exactly while the RayCluster is `SUSPENDED`, and it is written only when it changes, so its timestamp is the transition time. The clocks then need no new field: the admission clock starts at the RayCluster's creation or its latest eviction (a `Queued` transition), and the sensor keeps the remaining budget in workflow state, spending none of it while the RayCluster is `SUSPENDED`.
+- **Only provisioning is cumulative.** That is what stops a RayCluster that is admitted but can never become `READY` (a bad image, an unsatisfiable selector, quota above real capacity): an eviction pauses its budget instead of resetting it. The admission clock restarts at each eviction, because a cluster evicted by operator action should not inherit its earlier wait.
+- **Placement waits count against both clocks.** They signal a fault (no LocalQueue, an ask above every quota, every carrying cluster unready) that should surface within the task budget. Only queueing inside Kueue is normal contention, so only time `SUSPENDED` is excluded from provisioning.
+- **Kueue's timer is a backstop.** `waitForPodsReady` (always on from Kueue 0.19) is set to 1 h, above the 1800 s budget, so it never evicts a Uniflow cluster that is still provisioning. It bounds consumers without a provisioning budget: Kueue deactivates a workload after its third failed start, and the admission clock then deletes it (RFC-20260805).
+- **Eviction after `READY` takes operator action** (stopping a queue), because preemption and recovery eviction are off (RFC-20260805). It kills the running job, as node loss would.
+- **Uniflow's task retry applies** to `AdmissionTimeout` as to any failure. The bound is one operator setting, not per pipeline, because it detects a deployment-wide fault, an undersized quota, rather than a property of one job.
+- **No change without Kueue:** nothing is `SUSPENDED` and the admission clock does not run, so provisioning equals today's budget.
 
-The design splits the budget by phase:
+*Why the control plane owns the admission bound:* the bound must apply to every consumer of a RayCluster, not only Uniflow, and expiry must delete the compute-side object, which a workflow timeout cannot do.
 
-- While the cluster is `SUSPENDED` (the `Queued` condition is `True`), the readiness sensor does not consume the creation budget. The admission wait is bounded by Kueue-native mechanisms and, optionally, an operator-set queue timeout, and is reported through the suspended state rather than as a pending failure.
-- The 1800-second budget starts when Kueue flips `suspend=false`, covering admission → readiness, which is the phase it was always sized for.
+*Why 24 h:* it rides out a daily peak on a saturated queue and surfaces an undersized quota within a day. It is also far inside the 7-day workflow timeout, whose expiry would abandon the suspended cluster: it would keep its queue position and, if admitted later, hold quota for nobody.
 
-This touches the sensor activity and the Ray plugin and is **Phase 0** below. On Kueue-managed clusters the inflated `RAY_NUM_REDIS_GET_RETRIES` also becomes unnecessary, since gang admission removes the condition it compensates for; the default stays for non-Kueue clusters.
+*Rollout:* the sensor change ships behind workflow versioning, so in-flight workflows keep their current semantics. Clusters already waiting when Phase 0 deploys are measured from creation; none created through Uniflow can be older than its 1800 s budget.
 
-### Phase 1 — the compute-cluster stack and where queue objects live
+**0b. One placement decision per job (P2).** With the Kueue backend, the cluster that `Select` returns at enqueue becomes the job's assignment and is validated there, and the scheduler dispatches to it without selecting again. Only re-placement (0f) makes a new decision, with a new validation.
 
-**Install.** Every cluster that runs Michelangelo batch workloads installs the `michelangelo-compute` chart (RFC-20260805): KubeRay operator, Spark Operator, Kueue (as a condition-gated subchart, released alongside the operators), the control-plane identity RBAC, and the cluster's queue objects, in the two-phase order that CRD establishment requires. The operator then marks the cluster `scheduler_type: SCHEDULER_TYPE_KUEUE` and enables `jobs.scheduler.backend: kueue` on the control plane, exactly as the merged guide describes. Installing the chart on a cluster whose `Cluster` CR is *not* marked is safe: the backend stamps no label, and Kueue with `manageJobsWithoutQueueName: false` (upstream default) observes and admits nothing.
+- *Why:* validation means nothing unless it applies where the job runs, and Phase 2's strategy reads live state by design.
+- *Why not validate at dispatch instead:* that would be equally safe, but it would move the `Enqueued` condition out of the `JobQueue` seam that #19 and #1985 established.
 
-**Namespace invariant.** Kueue admits a workload only if the referenced LocalQueue exists in the *workload's* namespace. The jobs client creates KubeRay RayClusters in the fixed local namespace (`default`, `RayLocalNamespace`), so every LocalQueue lives in `default` and per-project queues are distinguished by name (`ma-<project>`), not namespace. Phase 3 keeps the same invariant for `SparkApplication`s. Materializing per-project namespaces on compute clusters would strengthen tenancy and this topology would inherit it transparently, but it is separate scope (mapper, RBAC, cleanup) — see Open questions.
+**0c. Project identity from the namespace (P3).** Queue resolution uses the job's namespace. The `ma/project-name` label is honored only when `jobs.scheduler.kueue.trustProjectLabel: true`, which is meant for deployments whose admission path stamps the label and overwrites any client-supplied value. Deployments that rely on the label today set it when they upgrade.
 
-**Where the queue objects live.** The objects have different cardinalities and different owners, so they should not share one home:
+- *Why:* in OSS only callers set the label, so giving it precedence lets anyone use any project's LocalQueues. Deployments that stamp it lose nothing by opting in.
+- A namespace is itself authorization-bound only under `apiserver.auth.mode: k8s-rbac` (enhancements#20). Under the default `dummy` mode, LocalQueues give attribution and an allowlist, not isolation.
 
-| Object | Cardinality | Owned by | Home |
+**0d. Read access for the control-plane identity (P5).** The identity needs read access (`get`, `list`, `watch`) to LocalQueues in `default`, for the existing enqueue check and Phase 2's watches, and to ClusterQueues, for Phase 2. It needs nothing else in `kueue.x-k8s.io`, and nothing writable. RFC-20260805 grants exactly this; clusters built by hand need the same grants.
+
+**0e. An accurate view of each cluster (P4, P5).**
+
+- A failed health probe marks the cluster not Ready. Today the failure is discarded, so an unreachable cluster keeps reporting Ready and keeps receiving jobs.
+- A change to `scheduler_type` or to the cluster's credentials takes effect without a restart: the controller refreshes its cached `Cluster` and rebuilds the cluster's client. Once Phase 2 ships, marking and unmarking also start and stop the cluster's Kueue watches.
+- *Why:* marking is the per-cluster rollout and rollback, token rotation (RFC-20260805) must not need a restart, and readiness is the signal re-placement (0f) and Phase 2 rely on.
+
+**0f. Dispatch: retry, re-place or fail (P5).**
+
+- A create that fails with a transient error is retried in place, with capped exponential backoff, for up to 10 minutes. Every error is transient except a validation rejection or a denied permission (403); a rejected token (401) is transient, because re-registering the token fixes it without a restart (0e). `AlreadyExists` counts as success, as today.
+- With the Kueue backend, the job is instead re-placed with a new decision (0b) when its target is not Ready or the window ends, provided no create can have succeeded: every attempt was rejected or never reached the cluster.
+- Otherwise the RayCluster fails with `ClusterCreationFailed`, as today.
+
+The window counts against the provisioning budget.
+
+- *Why retry:* Kueue's webhooks fail closed. With two replicas (RFC-20260805) outages are short, but a rolling upgrade or a network blip still rejects creates, and today a single rejected create fails the job.
+- *Why re-place only after a provable non-create:* object names are deterministic, so retrying on the same cluster is idempotent, while creating elsewhere after an ambiguous failure, such as a timeout, could leave an orphan running on the first cluster.
+
+### Phase 1 — compute-cluster contract and object ownership
+
+Every Kueue-managed cluster runs RFC-20260805's charts. The Kueue objects split by owner:
+
+| Object | Cardinality | Owner | Home |
 |---|---|---|---|
-| `ResourceFlavor`, `ClusterQueue`, optional `WorkloadPriorityClass` set | one set per compute cluster | the cluster operator (capacity) | Rendered by the `michelangelo-compute` chart from `kueueQueues.*` values; the sandbox's per-cluster values are the worked example. |
-| `LocalQueue` `ma-<project>` | one per project, on every Kueue-managed cluster the project may land on | project onboarding | Authored with the project definition. The chart renders them from a `kueueQueues.localQueues` list for platform-managed installs; the human-readable reference lives next to the project's own manifests. |
+| `ResourceFlavor`, `ClusterQueue`, optional `WorkloadPriorityClass` set | One set per cluster | Cluster operator (capacity) | RFC-20260805's queues chart, with quota as required input |
+| `LocalQueue` `ma-<project>` in namespace `default` | One per project, per cluster the project may run on | Project onboarding | The queues chart's list (centrally managed fleets) or applied by hand (self-service), exactly one of the two per queue name |
 
-`michelangelo-examples` was evaluated as the home for that reference, and it fits the LocalQueue half well — with limits worth stating:
+Rules, each with its reason:
 
-- **The layout already matches.** Each example project is a directory with `config/project.yaml` (the Michelangelo `Project` CR, namespace `california-housing`, `bert-cola`, …) plus its pipelines, and `bert_cola/inferenceserver/` already ships non-pipeline manifests (`InferenceServer`, `Deployment`) as reference YAML applied by hand. A `config/kueue/localqueue.yaml` per project — `LocalQueue ma-california-housing` in namespace `default`, pointing at the cluster's `ClusterQueue` — is the same pattern, and it documents the naming and namespace contract (`localQueueTemplate`, `RayLocalNamespace`) exactly where a project author sees it. Onboarding a project to a Kueue-managed fleet then reads: apply `project.yaml` on the control plane, apply the project's LocalQueue on each compute cluster.
-- **It should not be the source of truth for cluster capacity.** `ClusterQueue` quotas are per-cluster operator decisions; a copy in an examples repo would drift from the clusters it describes. The chart values own those, and Kueue upstream already publishes the generic single-ClusterQueue example (`kueue.sigs.k8s.io/examples/admin/single-clusterqueue-setup.yaml`) — the examples repo should show the Michelangelo-specific contract, not re-teach Kueue.
-- **Packaging and audience are a mismatch to manage, not a blocker.** `michelangelo-examples` is a pip-installable wheel and a per-project container image aimed at pipeline authors ("try it in five minutes"), and its CI runs lint, import, and local-run smoke tests — nothing validates Kubernetes manifests. Queue YAML there is reference material for the sandbox tier, like the inference-server manifests, and should be labeled as such; a `kubeconform`/dry-run check is cheap to add if it grows.
+- **Quota is shared per cluster.** Every LocalQueue on a cluster feeds its one ClusterQueue, so projects share that quota in Kueue's order, and a project's LocalQueue decides only whether the project may use the cluster. A shared pool never strands capacity in an idle project's slice. Fleets that need hard per-project limits author one ClusterQueue per project outside the chart; placement reads whichever ClusterQueue the project's LocalQueue feeds (Phase 2).
+- **Namespace `default`.** Kueue looks up a workload's LocalQueue in the workload's own namespace, and the control plane creates every RayCluster there (and, under Phase 3, every SparkApplication). Projects' queues are therefore distinguished by name.
+- **One manager per queue name.** Helm refuses to adopt an object it did not create, and it reverts hand edits to objects it did create.
+- **LocalQueue presence is the allowlist.** A project can run on a Kueue-managed cluster only if its queue exists there.
+- **Each project's reference LocalQueue belongs in `michelangelo-examples`,** beside its project configuration, where project authors already look. ClusterQueues do not, because capacity is a per-cluster decision that would drift in an examples repository.
+- **Quota is sized for what Kueue charges:** the log-collector sidecar (100m CPU and 128Mi per Ray pod when log persistence is on) counts, the RayJob submitter pod does not, and for Spark, Kueue adds the JVM memory overhead and cores it computes itself.
 
-The recommendation, carried into RFC-20260805's values schema: chart-rendered capacity objects, a chart-rendered *list* of LocalQueues for fleets that manage projects centrally, and a per-project LocalQueue reference in `michelangelo-examples` for the "onboard one project by hand" path — both producing the identical object.
+### Phase 2 — Kueue-aware placement
 
-**Eviction is not uniformly recoverable, and the difference matters.** Kueue can evict an admitted workload (preemption, or a `waitForPodsReady` timeout if an operator enables it), and the consequences depend on whether the cluster had already become ready:
+`jobs.scheduler.assignmentStrategy: kueue_aware` is opt-in. `kueue_aware_shadow` computes and reports the decision but assigns as `cluster_only` does.
 
-- **Evicted before ready** — preempted while still pending, or pods never all came up. Kueue re-suspends the object and requeues it. The cluster returns to `SUSPENDED`, the readiness sensor keeps waiting (per the budget split above), and nothing fails. This is the well-behaved path.
-- **Evicted after ready, with a Ray job running on it** — the workers are deleted and the running task fails. Recovery is Uniflow's existing task-level retry: a fresh submission that queues like any new job, losing in-progress work. There is no transparent mid-run requeue, and providing one would require checkpoint-aware resubmission that is out of scope here.
+**State.** For each Kueue-managed cluster, the control plane watches its ClusterQueues and the LocalQueues in `default`, read-only, at `jobs.scheduler.kueue.apiVersion`.
 
-Preemption policies and `waitForPodsReady` timeouts are therefore not free to enable on clusters running long training jobs — a point the operator guide must make alongside the `waitForPodsReady` blast-radius caveat in Open questions.
+- Per ClusterQueue it reads:
+  - nominal quota and covered resources;
+  - reserved quota (`status.flavorsReservation`);
+  - pending workloads;
+  - `stopPolicy`, flavors and cohort.
+- Per LocalQueue it reads the target ClusterQueue and the `Active` condition.
 
-### Phase 2 — Kueue-aware multi-cluster assignment
+A cluster is **scorable** for a project when its watches have synced and the ClusterQueue the project's LocalQueue feeds has one flavor and no cohort. A cluster that stops answering fails its next health probe (every 30 s) and leaves the candidate set (0e). A Kueue that answers but has stopped admitting still looks healthy; jobs placed there wait until the admission bound.
 
-The assignment decision under `jobs.scheduler.assignmentStrategy: kueue_aware`:
+**Ask.** The ask is computed from the objects the job will create, as Kueue will charge them:
 
-```mermaid
-sequenceDiagram
-    participant Q as KueueJobQueue (main)
-    participant K as KueueAwareAssignmentStrategy
-    participant F as cluster_only fallback
-    participant C as RegisteredClustersCache
+- **Ray:** the pod specs after the control plane's own mapping. That is the head plus each worker group × replicas, collector sidecar included. Clusters are fixed-size today (replicas = `MinInstances`), which is also Kueue's PodSet count.
+- **Spark** (Phase 3): Kueue's own formula, covering cores, and memory plus overhead.
 
-    Q->>K: Select(job)
-    alt job kind has no resource model here
-        K->>F: delegate unchanged
-        F-->>Q: first available / affinity cluster
-    else RayCluster (Phase 2) or SparkJob (Phase 3)
-        K->>K: queue = ResolveLocalQueueName(project)   (same resolver the backend uses)
-        K->>K: asks = Σ pod sets × counts (all containers, incl. sidecars)
-        loop each registered cluster
-            K->>C: GetClusterKueueState(cluster)
-            C-->>K: {Available, Queues, Flavors}
-            Note over K: skip if !Available, scheduler_type != KUEUE,<br/>no LocalQueue named queue, or AvailableQuota < asks
-        end
-        alt candidates exist
-            K-->>Q: highest headroom score, alphabetical tiebreak<br/>"kueue:cluster=X,queue=Q,headroom_cpu=N"
-        else none
-            K-->>Q: (nil, false, "kueue:no-cluster-with-matching-queue")<br/>scheduler retries per existing backoff
-        end
-    end
-```
+Ephemeral storage is left out, because Kueue is configured to exclude it.
 
-1. **Informer-backed cache.** For every registered cluster whose `scheduler_type` is `SCHEDULER_TYPE_KUEUE`, the cluster controller runs dynamic-client informers for `clusterqueues`, `resourceflavors` (cluster-scoped) and `localqueues` (all namespaces) at the configured `jobs.scheduler.kueue.apiVersion`, with a 5-minute resync, maintaining a per-cluster snapshot in `RegisteredClustersCache`:
-   - `ClusterQueueSnapshot{Name, NominalQuota, UsedQuota, AvailableQuota, Flavors, LocalQueueNames}` with `AvailableQuota = max(0, Nominal − Used)` per resource, nominal read from `spec.resourceGroups[].flavors[].resources[]` and usage from the ClusterQueue's flavor-usage status, summed across flavors and resource groups.
-   - `KueueClusterState{Available, Queues, Flavors}` — `Available=false` when Kueue is absent. Absence is detected by classifying list errors (`NotFound` or `NoKindMatchError`), logged once per cluster, and never blocks cluster registration.
-   - Lifecycle: informers start when a cluster registers (or is marked Kueue-managed) and are cancelled when it is removed, unmarked, or the manager shuts down.
-2. **`KueueAwareAssignmentStrategy`** (selected by config, below):
-   - **Fallback (required):** `AssignmentStrategy` is shared by all batch job types. The strategy embeds a `cluster_only` fallback and delegates any job kind it has no resource model for — every non-Ray kind until Phase 3, and any job bound by affinity. Without this, enabling `kueue_aware` would make those jobs permanently unschedulable.
-   - Resolve the queue with the *same* resolver the backend uses (`ResolveLocalQueueName(project)`), so placement and validation can never disagree about which LocalQueue a job wants.
-   - Sum resource asks over the job's pod sets: for a RayCluster, head + each worker group × `MinInstances`, in milli-units, summing **every container** in each pod template rather than `containers[0]` alone. Ray pods are not single-container when log persistence is enabled: `injectCollectorSidecar` adds a collector to the head *and* every worker template (`k8sengine/ray.go`). Counting only the first container understates each pod's real request, which inflates apparent headroom and lets the strategy route a job to a cluster that then cannot admit it — the precise failure this strategy exists to prevent, and one whose magnitude scales with worker count.
-   - Candidate filter per cluster: `state.Available`, a LocalQueue named `queue` in the dispatch namespace, and its ClusterQueue's `AvailableQuota` covering every asked resource (a resource the queue doesn't declare counts as zero).
-   - Score: Σ over {cpu, memory, nvidia.com/gpu} of `(available − ask) / nominal`; resources with zero nominal quota are skipped (prevents division by zero and score domination). Highest score wins; ties break alphabetically by cluster name for determinism.
-   - Reason strings are prefixed `kueue:` (`kueue:cluster=X,queue=Q,headroom_cpu=N` on success, `kueue:no-cluster-with-matching-queue` on miss) so assignment decisions are grep-able in scheduler logs. On miss the scheduler retries per its existing backoff.
-3. **Multi-cluster sandbox.** `--compute-cluster-name` becomes repeatable (and `--num-compute-clusters N` auto-names), with `--compute-cluster-quotas` accepting per-cluster overrides passed as `kueueQueues.quota` chart values on the phase-2 upgrade (Helm's deep merge keeps unspecified resources at chart defaults) — so a two-cluster sandbox gives the strategy a meaningful choice to verify end to end.
+**Decision.**
 
-### Phase 3 — Spark on compute clusters
+| # | Step | Rule |
+|---|---|---|
+| 1 | Pin | If `michelangelo/cluster-affinity` names a registered cluster, only that cluster is considered. A pin skips ranking, not the checks: a Kueue-managed pin must pass steps 2 and 3, and any other pin is assigned as today. |
+| 2 | Candidates | Ready, Kueue-managed clusters that carry the project's LocalQueue, read from the watch cache, or directly while the cache has not synced. |
+| 3 | Eligible | A scorable candidate is eligible if its nominal quota covers the ask for every requested resource; a resource the ClusterQueue does not cover counts as zero, as in Kueue. Unscorable candidates stay. |
+| 4 | Rank | Candidates whose LocalQueue is inactive or whose ClusterQueue is stopped go last (**tier 4**); Kueue holds a job there until the queue resumes. The rest: **tier 1**, scorable with the ask fitting in free quota now, by most bottleneck slack; **tier 2**, the others with synced state, by fewest pending workloads, in-flight included, then smallest deficit, unknown last; **tier 3**, state not yet synced, in `cluster_only` order. Ties break by cluster name. |
+| 5 | Assign | The top-ranked cluster (0b). If it cannot admit the job yet, Kueue queues it there. |
 
-Spark today is control-plane-local: the Spark job controller (`go/components/spark/job`) builds a `SparkApplication` and creates it with the controller manager's own client, in the `SparkJob`'s namespace, with a hardcoded `spark-operator-spark` service account, on whichever cluster the control plane runs on. The scheduler framework already models `BatchSparkJob`, but the federated jobs client's mapper has no Spark case. Bringing Spark onto the compute-cluster stack is three aligned changes:
+When steps 2 and 3 leave no candidate:
 
-1. **Dispatch through the federated jobs client.** Implement the `SparkJob` → `SparkApplication` mapping in `k8sengine`, so a SparkJob is assigned a cluster by `AssignmentStrategy`, validated by `KueueJobQueue`, and created on that cluster through the same path RayClusters use. The queue label comes from the same `kueueQueueName` resolver; user labels still do not cross the boundary. The mapping keeps the driver/executor pod specs Michelangelo already builds and adds the identity contract the compute chart establishes: the Spark Operator's per-namespace `spark-operator-spark` service account in every namespace SparkApplications are created in (`spark.jobNamespaces`), and `sparkoperator.k8s.io` verbs on the control-plane identity (RFC-20260805).
-2. **Admission via Kueue's SparkApplication integration.** Kueue admits `SparkApplication`s natively from v0.17 (alpha, feature gate `SparkApplicationIntegration`, framework `sparkoperator.k8s.io/sparkapplication`), suspend-based like the Ray integrations, with pod sets for the driver and `executor.instances` executors. Two constraints shape Michelangelo's mapping: **cluster mode only** (already the case), and **dynamic allocation is rejected by webhook** — `executor.instances` must be explicit. The Spark Operator must be v2.4.0 or newer, the release that added `spec.suspend`. Both requirements are chart pins in RFC-20260805; until a cluster meets them, SparkJobs dispatched there are placed by `cluster_only` and admitted immediately, exactly as Ray was before Kueue.
-3. **Headroom for Spark.** The `kueue_aware` strategy gains a Spark resource model: driver pod + `executor.instances` × executor pod, every container counted, using the same score. Until item 1 lands, SparkJobs take the fallback path; nothing about the strategy's interface changes.
+| Case | Outcome |
+|---|---|
+| No considered Kueue-managed cluster carries the LocalQueue | An unpinned job falls back to `cluster_only` over Ready non-Kueue clusters. A pinned job, or one with no such cluster, waits with `KueueQueueNotFound`, naming the queue. |
+| The LocalQueue exists only on unready clusters | The job waits with `KueueClusterNotReady`. |
+| No candidate is eligible | The job waits with `KueueQuotaExceeded`, so a quota increase takes effect. |
 
-Kueue's own guidance on JVM overhead applies to quota sizing: the operator guide should tell operators whether `memoryOverheadFactor` is folded into the executor request (see Open questions, quota sizing inputs).
+A waiting job keeps `Enqueued=False` and its reason between re-evaluations, and its status is written only when the reason changes. Every such wait counts toward the admission bound and, for Uniflow tasks, toward provisioning (0a).
 
-### How the design maps to the problems
+The ranking uses four derived quantities:
 
-| # | Problem | Mechanism | Status |
+- **free** = nominal − reserved − in-flight, per covered resource.
+- **in-flight** = the asks of jobs assigned to the cluster that the control plane has not yet seen held or admitted there, or saw less than 30 s ago. Without it, a burst would see one snapshot and, through the name tiebreak, pile onto one cluster. It is derived from the jobs' recorded assignments, so it survives a leader failover, and in shadow mode it counts the jobs actually assigned. The 30 s covers the 10 s status poll and Kueue's status update, erring toward double counting, which spreads a burst rather than herding it.
+- **bottleneck slack** = the minimum, over the resources the job requests, of (free − ask) / nominal.
+- **deficit** = the maximum, over the resources the job requests, of (ask − free) / nominal.
+
+*Worked example.* A CPU-only job asks for 16 CPU and 64Gi.
+
+| Cluster | Nominal (cpu / memory / GPU) | Free | Slack (cpu, memory) → bottleneck |
 |---|---|---|---|
-| 1 | Capacity-blind multi-cluster placement | `kueue_aware` assignment scores clusters by quota headroom, using the merged backend's own queue resolver (Phase 2). | Designed (opt-in) |
-| 2 | Queueing burns the creation budget | Budget split at admission; suspended time is reported, not charged (Phase 0). | Designed; prerequisite for enabling queueing at depth |
-| 3 | Spark not on compute clusters / not admitted | Federated dispatch of `SparkApplication`s with the resolved queue label; Kueue `sparkoperator.k8s.io/sparkapplication` integration (Phase 3). | Designed; gated on Kueue ≥ 0.17 and Spark Operator ≥ 2.4.0 |
-| 4 | Compute side unpackaged; queue objects have no home | `michelangelo-compute` chart (RFC-20260805) renders capacity objects and a LocalQueue list; per-project LocalQueue reference in `michelangelo-examples` (Phase 1). | Designed |
-| 5 | Priority | Map `SchedulingSpec.preemptible` (and a future priority field) to a `WorkloadPriorityClass` stamped by the control plane, never by users. | Open question |
-| 6 | Hardware-aware routing | `ResourceFlavor` per SKU is the abstraction; Phase 2 routes *across clusters* by live capacity. | Extension path only |
+| A, GPU pool | 64 / 256Gi / 8 | 20 / 80Gi / 8 | 0.06, 0.06 → 0.06 |
+| B, CPU pool | 128 / 512Gi / 0 | 40 / 160Gi / 0 | 0.19, 0.19 → **0.19** |
+
+B wins. A score summed over all resources would credit A's idle GPUs (+1.0) and send a CPU job to the GPU pool, consuming the CPU its GPU jobs need.
+
+Why each choice:
+
+- **Rank rather than filter.** Holding jobs until some cluster has room would turn the control plane into a second queue, one without Kueue's ordering, fair sharing, priority or `Queued` signal, and it would starve large jobs. Kueue remains the only queue; placement only picks which cluster's queue. A job waits outside Kueue only when placement is structurally impossible: no LocalQueue on a Ready cluster, or an ask above every nominal quota.
+- **Eligibility by nominal quota.** A job larger than a ClusterQueue's nominal quota can never be admitted there. Under `cluster_only` it would wait out its admission bound.
+- **Objective: shortest time to admission, robust to estimation error.** Most slack picks the cluster where the job fits with the largest margin, so a stale snapshot or an imperfect ask is least likely to turn "fits" into "queues". Rejected alternatives:
+  - *Random:* ignores state.
+  - *Fewest pending alone:* an empty queue on a full cluster still waits.
+  - *Best-fit packing:* it targets clusters where the job barely fits, exactly where stale state flips the outcome.
+
+  Cross-cluster packing for very large jobs would need re-placement, which is out of scope.
+- **Reserved, not admitted, usage.** `flavorsReservation` includes workloads still in admission checks; admitted-only usage would overstate free quota.
+- **Queue depth when nothing fits.** Pending count is a proxy for the wait, not the wait: under `BestEffortFIFO`, smaller workloads can pass a blocked head. It is the best per-queue signal Kueue exposes, and counting in-flight jobs keeps a burst from herding onto the shortest queue.
+- **Unscorable clusters compete on queue depth.** Kueue assigns one flavor per resource group, and borrowing depends on the whole cohort's state, so free quota cannot be computed for multi-flavor or cohort queues. They rank in tier 2, so an idle one still beats a full scorable cluster. Unsynced clusters keep today's order.
+- **Non-Kueue clusters only for projects that are not onboarded.** A project with a LocalQueue anywhere never falls back, so neither a full cluster nor a restart lets it bypass Kueue. Other projects run as today; to put every project under quota, mark every cluster.
+- **One-shot placement.** Once dispatched, a job stays put: moving a queued job would forfeit its queue position, and Kueue admits it as soon as quota frees up there. The cost is that a job queued on a cluster that later fails, or whose queue stops, waits up to the admission bound.
+
+**Observability.** The `Scheduled` condition names the chosen cluster and tier. Binding resource and slack reflect other projects' usage, so they go to the controller log and to a metric of decisions by strategy, tier and outcome. Shadow mode reports the would-be decision next to the actual one. Phase 0 adds counters for `AdmissionTimeout`, create retries and re-placements, by reason, and a histogram of admission wait.
+
+**Success criterion and tests.**
+
+- **Success:** on an e2e fleet of two compute clusters with skewed quotas and a fixed, seeded workload, `kueue_aware` lowers p50 and p95 admission wait relative to `cluster_only`, which on `main` is effectively a random choice per job.
+- **On real fleets:** shadow mode's would-have-fit-elsewhere rate tells operators whether enabling pays off.
+- **Test matrix:**
+  - stale and unsynced state;
+  - a burst of submissions, across a leader failover;
+  - Kueue absent;
+  - multi-flavor and cohort queues;
+  - an unreachable target;
+  - a long suspension ending in `AdmissionTimeout`;
+  - eviction before `READY`;
+  - webhook unavailability.
+
+### Phase 3 — the Kueue contract for Spark
+
+Moving Spark execution to compute clusters (closing the Background gaps, and migrating namespaces, identity and logs) is a separate change with its own RFC. This RFC fixes only what Kueue admission requires of that change:
+
+| Area | Contract | Why |
+|---|---|---|
+| Placement and label | The cluster comes from 0b and Phase 2; the queue label comes from the same resolver | One contract for Ray and Spark |
+| Namespace and driver SA | Namespace `default`, driver SA `spark-operator-spark` | LocalQueues live in `default`, and RFC-20260805 guarantees the SA there |
+| Executors | `executor.instances` is always explicit. On Kueue-managed targets, `spark.dynamicAllocation.*` in `spark_conf` and resource settings in pod-template files are rejected. | Kueue sizes the workload from `executor.instances`, and its webhook rejects only the typed dynamic-allocation field. Both other paths would grow pods beyond the reserved quota. |
+| Memory and GPU | Memory in Java format (`512m`, `2g`). The GPU resource name is `nvidia.com/gpu`, not a SKU. GPU pods tolerate the NVIDIA taint, as Ray pods do (michelangelo#2182). | Kueue rejects Kubernetes-style Spark memory values, and it charges GPUs under the name in the GPU spec. |
+| Status | The Spark status mapping recognizes `SUSPENDING` and `SUSPENDED` as `Queued` | Today's mapping predates suspend, so an application Kueue holds goes unrecognized |
+| Bounds and retries | 0a's admission bound and 0f's dispatch rules, in the SparkJob controller | Same reasons as for Ray |
+| Floors | Kueue ≥ 0.19.9 (or ≥ 0.20.2); Spark Operator ≥ 2.4.0 | Earlier Kueue under-reserves Spark's memory overhead and cores, lets restarts run outside quota, and mishandles suspension without explicit executor counts. 2.4.0 added `spec.suspend`. |
+
+RFC-20260805 keeps Kueue's alpha `SparkApplicationIntegration` gate, and the Spark framework with it, off until that change ships, and turns both on by default from that release. The pinned, CI-tested Kueue version contains the alpha risk. Where the gate is off, Kueue answers SparkApplications with a no-op webhook, so labeled applications run immediately. Turning the gate off would strand applications Kueue already holds, so rollback unmarks the cluster, lets held applications drain, and only then turns the gate off.
 
 ## APIs and CRDs
 
-No Michelangelo proto or CRD schema changes; `scheduler_type` already exists. The public surface delta:
-
-**controllermgr config** (under the `jobs.scheduler` tree michelangelo#1985 introduced; absent key preserves current behavior, unknown values fail at startup like `backend` does):
+There are no proto or CRD changes. The new controllermgr keys sit under the tree michelangelo#1985 added. When a key is absent, today's behavior holds; unknown values fail at startup.
 
 ```yaml
 jobs:
   scheduler:
-    backend: kueue                       # existing (michelangelo#1985)
-    assignmentStrategy: cluster_only     # new: "cluster_only" (default) | "kueue_aware"
+    backend: kueue                        # existing
+    assignmentStrategy: cluster_only      # new (Phase 2): cluster_only | kueue_aware_shadow | kueue_aware
     kueue:
-      localQueueTemplate: "ma-{project}" # existing
-      apiVersion: v1beta2                # existing; informers use the same version
+      localQueueTemplate: "ma-{project}"  # existing
+      localQueueOverrides: {}             # existing
+      apiVersion: v1beta2                 # existing; the Phase 2 watches use it too
+      admissionTimeout: 24h               # new (0a)
+      trustProjectLabel: false            # new (0c)
 ```
 
-**Provisioned Kueue resources** (operator contract, per Kueue-managed cluster; rendered by the `michelangelo-compute` chart, defaults shown — the LocalQueue is the per-project object that also ships as the `michelangelo-examples` reference):
+**New condition reasons:**
 
-```yaml
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ResourceFlavor
-metadata: {name: default-flavor}
-spec: {}
----
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: ClusterQueue
-metadata: {name: cluster-queue}
-spec:
-  namespaceSelector: {}
-  queueingStrategy: BestEffortFIFO
-  resourceGroups:
-  - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
-    flavors:
-    - name: default-flavor
-      resources:
-      - {name: cpu, nominalQuota: 16}
-      - {name: memory, nominalQuota: 32Gi}
-      - {name: "nvidia.com/gpu", nominalQuota: 4}
----
-# One per project, in the namespace where the control plane dispatches
-# workloads (RayLocalNamespace, "default"), named by localQueueTemplate.
-apiVersion: kueue.x-k8s.io/v1beta2
-kind: LocalQueue
-metadata: {name: ma-california-housing, namespace: default}
-spec: {clusterQueue: cluster-queue}
-```
+- `AdmissionTimeout`: a RayCluster or SparkJob failed because its admission wait exceeded the bound.
+- `KueueQuotaExceeded`: `Enqueued=False`, because the ask exceeds the nominal quota of every candidate.
+- `KueueClusterNotReady`: `Enqueued=False`, because every cluster that carries the project's LocalQueue is unready.
 
-**Labels on dispatched objects** — unchanged from michelangelo#1985: exactly `kueue.x-k8s.io/queue-name: ma-<project>`, set by the control plane, on RayClusters (today) and SparkApplications (Phase 3). No user label crosses the cluster boundary.
+**Labels on dispatched objects** are unchanged: exactly `kueue.x-k8s.io/queue-name`, set by the control plane. The compute-side objects each cluster carries are RFC-20260805's rendered queue objects.
 
-### Version compatibility
+**Version compatibility.** The control plane talks to Kueue through raw REST calls at a configurable API version, so it has no Kueue Go dependency.
 
-- **Control plane:** no Kueue Go dependency. The existence check and the Phase 2 informers speak `kueue.x-k8s.io/<jobs.scheduler.kueue.apiVersion>` (default `v1beta2`), so the control plane's `k8s.io/*` pin and Kueue's release line are decoupled — the constraint the original draft worked around no longer exists.
-- **Compute clusters:** Kueue **≥ 0.15** (first release serving `v1beta2`, and it carries the `clusterSelector` skip this design relies on); **≥ 0.17** with `SparkApplicationIntegration` enabled for Phase 3. `v1beta1` is deprecated upstream and being retired in the 0.20 line, so new installs should not start there; operators on older Kueue set `kueue.apiVersion: v1beta1`. The concrete chart pin and its bump cadence are RFC-20260805's.
-- **Spark Operator ≥ 2.4.0** on clusters that gate Spark.
+| Component | Floor | Why |
+|---|---|---|
+| Kueue, Ray gating | 0.15 | First release that serves `v1beta2` |
+| Kueue, Spark gating | 0.19.9 or 0.20.2 | Spark accounting and suspension fixes |
+| KubeRay | 1.1.0 | RayCluster `spec.suspend` |
+| Spark Operator | 2.4.0 | `spec.suspend` and the suspend states |
+
+Within that range, `waitForPodsReady` is opt-in before Kueue 0.19, so 0a's backstop exists there only if an operator enables it, and `v1beta1` is not served from 0.20. RFC-20260805's pins (Kueue 0.19.9, KubeRay 1.7.1, Spark Operator 2.5.2) are the tested configuration.
 
 ## Alternatives considered
 
-### Alternative A: `queue_name` / `priority_class_name` fields on the `RayClusterSpec` proto
-The original internal spec's design.
-**Pros:** typed, discoverable API; validation at CR-creation time.
-**Cons:** proto change fans out into Go and Python codegen with strict cross-language ordering; duplicates data that must ultimately become a Kubernetes label; and — decisive after michelangelo#1985 — a user-settable field would reintroduce the user-chosen-queue problem the merged backend closed.
-**Why not chosen:** the queue is derived from project identity on the control plane; there is nothing for a user-facing field to carry.
+**A. A user-chosen queue, through a proto field or a Starlark `queue=` parameter.** Typed and discoverable, but isolation becomes advisory and the field duplicates what must end up as a label. Rejected: the queue derives from authorization-bound identity (0c).
 
-### Alternative B: user-supplied queue via a Starlark `ray_cluster_spec(queue=...)` parameter (this RFC's original Phase 1)
-**Pros:** smallest possible first step; no control-plane notion of project ownership required.
-**Cons:** isolation between projects becomes advisory — a pipeline can draw against any queue by naming it — and it puts the label writer in the wrong layer. @apurvapatkeshwar raised exactly this on #19; the honest answer is that it was a sequencing shortcut, not a preference.
-**Why not chosen:** server-side resolution is on `main`. Phase 2 is the part of this RFC that was always meant to follow it.
+**B. Filter by headroom, and hold jobs in the control plane until a cluster has room.** Rejected: it builds a second, weaker queue (see "Rank rather than filter").
 
-### Alternative C: extend `AssignmentStrategy` instead of adding a `JobQueue` backend (this RFC's original seam)
-**Pros:** placement and the decision to stamp a queue label are made in one place; no new interface implementation.
-**Cons:** the `JobQueue` backend is what enforces *validation* at enqueue time (LocalQueue exists, project resolvable) and surfaces `Enqueued=False` with an actionable reason; folding that into placement would blur two responsibilities the merged design keeps apart.
-**Why not chosen:** michelangelo#1985 landed the `JobQueue` seam, and it composes with a Kueue-aware strategy without modification — the backend already calls `AssignmentStrategy.Select` to predict its target. The two designs turned out to be layers, not rivals, which is the framing #19's author proposed and this RFC adopts.
+**C. MultiKueue.**
+- *What it offers:* a manager cluster's Kueue offers each workload to the worker clusters, and the first to admit it wins. Placement on admission removes stale snapshots and herding by construction.
+- *Why not now:*
+  - *Topology.* The Ray and Spark objects must live in a manager cluster (`managedBy`), with a Kueue there holding credentials for every worker. Michelangelo's control plane creates objects directly on each compute cluster.
+  - *Coverage.* Kueue's SparkApplication integration has no MultiKueue adapter, so Spark could not use it.
+  - *Cost.* A second Kueue on the control-plane side, plus two systems placing jobs.
+- *Criterion:* adopt MultiKueue once it covers both Ray and Spark and the control plane can delegate dispatch to it. Phase 2 sits behind the existing strategy seam, so switching would replace one strategy.
 
-### Alternative D: MultiKueue (Kueue-native multi-cluster dispatch)
-**Pros:** upstream-supported multi-cluster admission; single control-plane queue view.
-**Cons:** requires a management-cluster Kueue deployment plus per-cluster kubeconfig plumbing inside Kueue's own controllers, running *beside* Michelangelo's existing scheduler — two placement brains; harder incremental rollout.
-**Why not chosen:** Michelangelo already owns cluster assignment via `AssignmentStrategy`. Feeding Kueue state into the existing strategy interface is a far smaller, reversible step. MultiKueue remains a possible future direction.
-
-### Alternative E: single Kueue in the control plane admitting v2pb CRs
-**Pros:** one Kueue install; queueing before assignment.
-**Cons:** Kueue has no integration for Michelangelo's CRDs (a custom framework plugin to build and maintain); quota is inherently a per-compute-cluster property, which a control-plane queue cannot see without exactly the state-sync this RFC builds anyway.
-**Why not chosen:** highest custom-code burden for the least upstream leverage.
+**D. One Kueue in the control plane, over Michelangelo CRs.** Rejected: it needs a custom Kueue integration for v2 CRDs, and quota is a property of each compute cluster, which a control-plane queue could see only through the state sync Phase 2 builds anyway.
 
 ## Open questions
 
-- [ ] **Priority mapping.** The merged allowlist forwards no priority label, correctly. The proposed first step is control-plane-stamped: `SchedulingSpec.preemptible: true` → a low `WorkloadPriorityClass`, everything else → default, with the class set (`high`/`default`/`low`) rendered by the compute chart so a stamped name always exists. Is `preemptible` the right first input, or should this wait for a typed priority field (michelangelo#929)?
-- [ ] **Queued-state *reason* and UX.** `Queued=True/AwaitingAdmission` says "not running", not "waiting behind 40 GPUs of quota". Kueue's `Workload` status carries the admission reason (`QuotaReserved` pending, `Inadmissible` with message); watching Workloads alongside the Phase 2 informers is the natural way to reflect it into the RayCluster/SparkJob status and the UI. Condition message, dedicated field, or `kubectl`-level detail?
-- [ ] **Headroom estimate vs autoscaling.** Resource asks use `MinInstances` per worker group, so headroom is optimistic for clusters that autoscale toward `MaxInstances`. Is min-based admission the right long-term contract, or should the strategy (and quota checks) consider max?
-- [ ] **Per-project namespaces on compute clusters.** All Ray objects dispatch into `default`, so LocalQueues are name-scoped and namespace-selector isolation is unavailable. Materializing per-project namespaces (mapper, RBAC, cleanup, Spark Operator `jobNamespaces`) is a real tenancy improvement; should Phase 3 — which touches the mapper anyway — reserve it, or is it a separate RFC?
-- [ ] **LocalQueue lifecycle.** This RFC keeps queues operator-authored (chart list or per-project YAML) with dispatch-time validation. Should the control plane eventually create `ma-<project>` on Kueue-managed clusters when a project is onboarded, and if so is `michelangelo-examples`' per-project reference still worth keeping as documentation?
-- [ ] **`waitForPodsReady`.** Enabling Kueue's all-or-nothing startup closes two gaps at once — quota admission vs true gang placement, and crashlooping jobs holding GPUs — but it is Kueue **installation-wide** `Configuration`, not per-ClusterQueue (a per-queue override is only an open upstream request, [kueue#7542](https://github.com/kubernetes-sigs/kueue/issues/7542)), so it governs *every* Kueue-managed workload on that compute cluster, and the merged guide advises against it for RayClusters whose workers start over a window. What timeout/backoff defaults, if any, are safe for ML workloads with long image pulls, and should the chart expose it at all?
-- [ ] **Quota sizing inputs.** Facts operators need when setting `nominalQuota`, currently undocumented: the log-collector sidecar (100m CPU / 128Mi when log persistence is enabled) is counted *inside* the gated Ray pod sets, on the head and every worker; the RayJob submitter pod runs *outside* Kueue quota; for Spark, the JVM `memoryOverheadFactor` is part of the executor request Kueue sees. A worked sizing example in the operator guide, or is stating the facts sufficient?
-- [ ] **Per-SKU ResourceFlavor taxonomy.** Ship flavors for common GPU SKUs with fallback ordering inside the default ClusterQueue, or leave flavor design to operators? Defaults make "run on A100s, fall back to L40S" declarative but couple the platform to a hardware catalog.
+- [ ] **Priority.** Should `SchedulingSpec.preemptible: true` map to a low `WorkloadPriorityClass`, stamped by the control plane from a class set RFC-20260805's queues chart renders by default, or wait for a typed priority field ([michelangelo#929](https://github.com/michelangelo-ai/michelangelo/issues/929), open)?
+- [ ] **Queued reason.** `AwaitingAdmission` says the job is not running, but not why. Kueue's `Workload` status explains it (for example, pending on 40 GPUs). Should the control plane reflect that in a condition message, a status field or the UI?
+- [ ] **Control-plane-created LocalQueues.** Should onboarding a project create `ma-<project>` on the Kueue-managed clusters it may use, replacing both authoring paths in Phase 1?
 
 ## Rollout strategy
 
-- **Phase 0 — prerequisite, before enabling queueing at any depth:** the creation-budget split in the Ray plugin and readiness sensor, so suspended time no longer consumes the 1800-second provisioning budget. `RAY_CLUSTER_STATE_SUSPENDED` (michelangelo#1700) and the `Queued` condition (michelangelo#1985) are already on `main`.
-- **Phase 1 — shippable alone:** the `michelangelo-compute` chart (RFC-20260805) installed on every sandbox cluster that runs batch workloads, rendering the capacity objects and the LocalQueue list; the per-project LocalQueue reference in `michelangelo-examples`; the operator guide's manual `helm install` + `kubectl apply` replaced by the chart's two commands. Backward compatible: unmarked clusters see no label and Kueue admits nothing.
-- **Phase 2 — opt-in:** per-cluster Kueue informers via the dynamic client; `KueueAwareAssignmentStrategy` behind `jobs.scheduler.assignmentStrategy`; the multi-cluster sandbox. Rollback is unsetting the flag — assignment reverts instantly; Phase 1 admission continues unaffected.
-- **Phase 3 — Spark:** federated `SparkJob` dispatch with the resolved queue label; Spark Operator ≥ 2.4.0 and Kueue ≥ 0.17 with the SparkApplication framework enabled via the chart; Spark resource model in the strategy. Clusters below the floor keep immediate admission for Spark, per cluster.
-- **Feature flags:** `jobs.scheduler.backend` (existing) and `jobs.scheduler.assignmentStrategy` (new) default to today's behavior; `scheduler_type` opts clusters in one at a time.
-- **Kueue-less clusters:** never fail registration; they are skipped by `kueue_aware` and fully served by `cluster_only`.
-- **Production clusters:** the sandbox flow is the reference; production compute clusters install the same chart through their own provisioning pipelines, overriding `kueueQueues.*` (quotas sized to real capacity, the project LocalQueue list, priority classes as needed).
+| Phase | Ships | Gate | Rollback | Done when |
+|---|---|---|---|---|
+| 0 | 0a–0f, in the control plane and the Uniflow Ray plugin | 0e and 0f's retry apply everywhere. The rest is inert unless `backend: kueue` is set and a cluster is marked. | Unmark clusters | In e2e with a scaled-down budget: a job whose admission wait exceeds its provisioning budget is admitted and succeeds, a never-ready cluster fails within its budget, a Kueue restart during submission fails no job, and an unreachable cluster stops receiving jobs |
+| 1 | RFC-20260805's charts on Kueue-managed clusters, with each project's LocalQueues | Inert until a cluster is marked | Unmark, which is non-destructive | A project without a LocalQueue gets `KueueQueueNotFound`; with one, its job is admitted |
+| 2 | Watches, `kueue_aware_shadow`, `kueue_aware` | Opt-in, shadow first | Strategy back to `cluster_only` (restart); assigned jobs stay put | The success criterion above |
+| 3 | The Spark contract, with federated Spark dispatch | The gate, per cluster | Unmark the cluster, let held applications drain, then turn the gate off | A labeled SparkApplication is held, admitted and succeeds, and dynamic allocation in `spark_conf` is rejected |
 
 ## References
 
-- [RFC-20260805: Compute Cluster Helm Chart](../20260805-compute-cluster-helm-chart/20260805-compute-cluster-helm-chart.md) — the Ray + Spark compute-cluster stack this RFC's Phase 1 rides on
-- [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19) — RFC for the Kueue scheduler backend (@apurvapatkeshwar); [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985) — its landing on `main`, with the operator guide `docs/operator-guides/jobs/kueue-scheduler-backend.md`
-- [michelangelo#1700](https://github.com/michelangelo-ai/michelangelo/pull/1700) — non-terminal `RAY_CLUSTER_STATE_SUSPENDED`
-- Prior art: [michelangelo#1129](https://github.com/michelangelo-ai/michelangelo/pull/1129), "Integration Kueue into compute cluster scheduler for ray job" — validated suspend/admit end to end on two k3d compute clusters
-- [RFC-20260702: `run_spark_job()`](../20260702-uniflow-spark-plugin/20260702-uniflow-spark-plugin.md) — the Spark entrypoints that share the compute stack
-- [michelangelo-examples](https://github.com/michelangelo-ai/michelangelo-examples) — per-project layout (`config/project.yaml`, `inferenceserver/`) the LocalQueue reference follows
-- [kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218) — Kueue skips RayJobs with `spec.clusterSelector`
-- [kueue#7542](https://github.com/kubernetes-sigs/kueue/issues/7542) — open request for per-ClusterQueue `waitForPodsReady`
-- Kueue: https://kueue.sigs.k8s.io/ (installation: https://kueue.sigs.k8s.io/docs/installation/; single-ClusterQueue example: https://kueue.sigs.k8s.io/docs/tasks/manage/administer_cluster_quotas/)
-- Kueue RayCluster integration: https://kueue.sigs.k8s.io/docs/tasks/run/rayclusters/
-- Kueue SparkApplication integration: https://kueue.sigs.k8s.io/docs/tasks/run/kubeflow/sparkapplications/
-- WorkloadPriorityClass: https://kueue.sigs.k8s.io/docs/concepts/workload_priority_class/
-- waitForPodsReady (all-or-nothing startup): https://kueue.sigs.k8s.io/docs/tasks/manage/setup_wait_for_pods_ready/
-- MultiKueue: https://kueue.sigs.k8s.io/docs/concepts/multikueue/
-- Kubeflow Spark Operator: https://github.com/kubeflow/spark-operator (suspend/resume from v2.4.0)
+- Merged backend: [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985), designed in [enhancements#19](https://github.com/michelangelo-ai/enhancements/pull/19) (RFC-20260804-kueue-job-queue). Operator guide: `docs/operator-guides/jobs/kueue-scheduler-backend.md`.
+- [RFC-20260805: Compute Cluster Helm Charts](../20260805-compute-cluster-helm-chart/20260805-compute-cluster-helm-chart.md), which packages the Phase 1 contract and sets the Kueue configuration Phase 0 relies on.
+- [enhancements#20](https://github.com/michelangelo-ai/enhancements/pull/20) (RFC-20260807-oidc-k8s-rbac-auth): the `k8s-rbac` mode that 0c relies on for isolation.
+- [michelangelo#1700](https://github.com/michelangelo-ai/michelangelo/pull/1700): the non-terminal `RAY_CLUSTER_STATE_SUSPENDED` state. [michelangelo#2182](https://github.com/michelangelo-ai/michelangelo/pull/2182): NVIDIA GPU taint toleration for RayClusters.
+- Kueue docs:
+  - [RayCluster integration](https://kueue.sigs.k8s.io/docs/tasks/run/rayclusters/)
+  - [SparkApplication integration](https://kueue.sigs.k8s.io/docs/tasks/run/kubeflow/sparkapplications/)
+  - [ClusterQueue](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/)
+  - [waitForPodsReady](https://kueue.sigs.k8s.io/docs/tasks/manage/setup_wait_for_pods_ready/)
+  - [MultiKueue](https://kueue.sigs.k8s.io/docs/concepts/multikueue/)
+- [kueue#7218](https://github.com/kubernetes-sigs/kueue/pull/7218): the pull request, released in 0.15.0, that makes Kueue skip RayJobs using `clusterSelector`.
+- [Kubeflow Spark Operator](https://github.com/kubeflow/spark-operator), which supports suspend from 2.4.0.
