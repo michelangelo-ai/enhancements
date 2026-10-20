@@ -39,8 +39,8 @@ Paths are under `go/components/` unless noted.
 | Placement | `cluster_only` returns the cluster named by the `michelangelo/cluster-affinity` label. Otherwise it returns the first entry of an unordered map of *all* registered clusters, whether ready or not, full or idle. | `jobs/scheduler/framework/cluster_only_assignment_engine.go`, `jobs/cluster/types.go` |
 | Enqueue (`jobs.scheduler.backend: kueue`) | Calls `Select` to *predict* the target. If the target is Kueue-managed: the project is the `ma/project-name` label, or else the namespace; the LocalQueue is the override, or else `ma-{project}`; the backend GETs that LocalQueue on the target. NotFound gives `Enqueued=False/KueueQueueNotFound`; any other error gives `KueueQueueCheckFailed`. Both are retried on later reconciles. | `jobs/scheduler/kueue/`, `jobs/common/utils/utils.go` |
 | Assignment | The scheduler calls `Select` *again* and assigns the job to that result. | `jobs/scheduler/scheduler.go` |
-| Dispatch | On a Kueue-managed cluster, stamps exactly one label, `kueue.x-k8s.io/queue-name`, on the RayCluster and never on RayJobs; the RayCluster goes to namespace `default`. Any create error other than AlreadyExists fails the RayCluster (`ClusterCreationFailed`). | `jobs/client/k8sengine/mapper.go`, `ray/cluster/controller.go` |
-| Waiting | While Kueue holds the RayCluster, its state is `SUSPENDED` and it carries `Queued=True/AwaitingAdmission`, restamped on every 10 s reconcile; the condition turns False only at `READY`. Meanwhile the Uniflow readiness sensor keeps spending its 1800 s creation budget, and when the budget expires it terminates the cluster. | `ray/cluster/controller.go`; `python/.../uniflow/plugins/ray/task.star`, `go/worker/plugins/ray/starlark_module.go` |
+| Dispatch | On a Kueue-managed cluster, under either backend, stamps exactly one label, `kueue.x-k8s.io/queue-name`, on the RayCluster and never on RayJobs; the RayCluster goes to namespace `default`. Any create error other than AlreadyExists fails the RayCluster (`ClusterCreationFailed`). | `jobs/client/k8sengine/mapper.go`, `ray/cluster/controller.go` |
+| Waiting | While Kueue holds the RayCluster, its state is `SUSPENDED` and it carries `Queued=True/AwaitingAdmission`, restamped on every 10 s reconcile; the condition turns False only at `READY`. Meanwhile the Uniflow readiness sensor keeps spending its 1800 s creation budget, and when the budget expires it terminates the cluster; under Temporal the budget never expires. | `ray/cluster/controller.go`; `python/.../uniflow/plugins/ray/task.star`, `go/worker/plugins/ray/starlark_module.go`; starlark-worker's Temporal adapter |
 | Cluster view | The cluster controller refreshes its cached `Cluster` only when host, port, region, zone, DC or SLA change, and each cluster's client, credentials included, is cached for the process lifetime, so a `scheduler_type` edit or a new token needs a restart. A failed health probe is discarded: an unreachable cluster stays Ready. | `jobs/cluster/`, `jobs/compute/factory.go`, `jobs/client/helper.go` |
 | Spark | The `SparkApplication` is created on the control-plane cluster, bypassing the scheduler, with the driver SA hardcoded to `spark-operator-spark`. The mapper rejects `SparkJob`, the federated client's Spark operations are stubs, and the controller recognizes three application states. | `spark/job/`, `jobs/client/` |
 
@@ -105,24 +105,25 @@ These changes are a prerequisite for marking any cluster outside a sandbox.
 
 | Clock | Counts | Bound | Enforced by | On expiry |
 |---|---|---|---|---|
-| Admission wait | Time waiting for admission, from creation and again from each eviction: placement waits (`Enqueued=False`) and time `SUSPENDED`. Dispatch to a non-Kueue cluster counts as admission. | `jobs.scheduler.kueue.admissionTimeout`, default `24h` | RayCluster controller | The RayCluster fails with `AdmissionTimeout`, and its compute-side object, if any, is deleted, releasing its queue position. |
-| Provisioning | Time from creation to `READY`, excluding time `SUSPENDED`, cumulative across evictions | The Uniflow task budget, default 1800 s | Uniflow readiness sensor | The task fails with the RayCluster's latest condition reason, and the RayCluster is deleted. |
+| Admission wait | Time waiting for admission, from creation and again from each eviction: time before dispatch and time `SUSPENDED`. Dispatch to a non-Kueue cluster counts as admission. | `jobs.scheduler.kueue.admissionTimeout`, default `24h` | RayCluster controller | The RayCluster fails with `AdmissionTimeout`, and its compute-side object, if any, is deleted, releasing its queue position. |
+| Provisioning | Time from creation to `READY`, excluding time `SUSPENDED`, cumulative across evictions | The Uniflow task budget, default 1800 s | Uniflow readiness sensor | The task fails with the RayCluster's latest condition reason, and the RayCluster is terminated. |
 
 The rules behind the table:
 
-- **`Queued` becomes exact.** It is True exactly while the RayCluster is `SUSPENDED`, and it is written only when it changes, so its timestamp is the transition time. The clocks then need no new field: the admission clock starts at the RayCluster's creation or its latest eviction (a `Queued` transition), and the sensor keeps the remaining budget in workflow state, spending none of it while the RayCluster is `SUSPENDED`.
+- **`Queued` becomes exact.** It is True exactly while the RayCluster is `SUSPENDED`, and it is written only when it changes, so its timestamp is the transition time; a cluster admitted before it is seen suspended records False once, at admission. The clocks then need no new field: the admission clock starts at the RayCluster's creation or its latest eviction (a `Queued` transition), and the sensor keeps the remaining budget in workflow state, spending none of it while the RayCluster is `SUSPENDED`.
 - **Only provisioning is cumulative.** That is what stops a RayCluster that is admitted but can never become `READY` (a bad image, an unsatisfiable selector, quota above real capacity): an eviction pauses its budget instead of resetting it. The admission clock restarts at each eviction, because a cluster evicted by operator action should not inherit its earlier wait.
-- **Placement waits count against both clocks.** They signal a fault (no LocalQueue, an ask above every quota, every carrying cluster unready) that should surface within the task budget. Only queueing inside Kueue is normal contention, so only time `SUSPENDED` is excluded from provisioning.
+- **Both workflow engines enforce the budget.** Today's is an activity retry-policy expiry, which starlark-worker's Temporal adapter drops.
+- **Placement waits count against both clocks.** They signal a fault (no LocalQueue, an ask above every quota, no Ready cluster to carry it) that should surface within the task budget. Only queueing inside Kueue is normal contention, so only time `SUSPENDED` is excluded from provisioning.
 - **Kueue's timer is a backstop.** `waitForPodsReady` (always on from Kueue 0.19) is set to 1 h, above the 1800 s budget, so it never evicts a Uniflow cluster that is still provisioning. It bounds consumers without a provisioning budget: Kueue deactivates a workload after its third failed start, and the admission clock then deletes it (RFC-20260805).
 - **Eviction after `READY` takes operator action** (stopping a queue), because preemption and recovery eviction are off (RFC-20260805). It kills the running job, as node loss would.
-- **Uniflow's task retry applies** to `AdmissionTimeout` as to any failure. The bound is one operator setting, not per pipeline, because it detects a deployment-wide fault, an undersized quota, rather than a property of one job.
-- **No change without Kueue:** nothing is `SUSPENDED` and the admission clock does not run, so provisioning equals today's budget.
+- **`AdmissionTimeout` fails the task,** as any failed provisioning does: Uniflow's task retry covers failed jobs, not failed provisioning. The bound is one operator setting, not per pipeline, because it detects a deployment-wide fault, an undersized quota, rather than a property of one job.
+- **The admission clock runs** while Kueue holds the RayCluster, under either backend, and with the Kueue backend also before dispatch. With the default backend and no marked cluster it never runs and nothing is `SUSPENDED`, so provisioning keeps today's budget.
 
 *Why the control plane owns the admission bound:* the bound must apply to every consumer of a RayCluster, not only Uniflow, and expiry must delete the compute-side object, which a workflow timeout cannot do.
 
 *Why 24 h:* it rides out a daily peak on a saturated queue and surfaces an undersized quota within a day. It is also far inside the 7-day workflow timeout, whose expiry would abandon the suspended cluster: it would keep its queue position and, if admitted later, hold quota for nobody.
 
-*Rollout:* the sensor change ships behind workflow versioning, so in-flight workflows keep their current semantics. Clusters already waiting when Phase 0 deploys are measured from creation; none created through Uniflow can be older than its 1800 s budget.
+*Rollout:* the sensor change ships behind workflow versioning, so in-flight workflows keep their current semantics. Clusters already waiting when Phase 0 deploys are measured from creation, so any waiting longer than the bound fail at once; under Cadence none created through Uniflow can be, because its 1800 s budget ended them.
 
 **0b. One placement decision per job (P2).** With the Kueue backend, the cluster that `Select` returns at enqueue becomes the job's assignment and is validated there, and the scheduler dispatches to it without selecting again. Only re-placement (0f) makes a new decision, with a new validation.
 
@@ -134,12 +135,12 @@ The rules behind the table:
 - *Why:* in OSS only callers set the label, so giving it precedence lets anyone use any project's LocalQueues. Deployments that stamp it lose nothing by opting in.
 - A namespace is itself authorization-bound only under `apiserver.auth.mode: k8s-rbac` (enhancements#20). Under the default `dummy` mode, LocalQueues give attribution and an allowlist, not isolation.
 
-**0d. Read access for the control-plane identity (P5).** The identity needs read access (`get`, `list`, `watch`) to LocalQueues in `default`, for the existing enqueue check and Phase 2's watches, and to ClusterQueues, for Phase 2. It needs nothing else in `kueue.x-k8s.io`, and nothing writable. RFC-20260805 grants exactly this; clusters built by hand need the same grants.
+**0d. Read access for the control-plane identity (P5).** The identity needs read access (`get`, `list`, `watch`) to LocalQueues in `default`, for the existing enqueue check and Phase 2's watches, and to ClusterQueues, for Phase 2. It needs nothing else in `kueue.x-k8s.io`, and nothing writable. RFC-20260805 grants exactly this; clusters built by hand need the same grants, under the chart's object names, so that installing the chart later adopts them.
 
 **0e. An accurate view of each cluster (P4, P5).**
 
-- A failed health probe marks the cluster not Ready. Today the failure is discarded, so an unreachable cluster keeps reporting Ready and keeps receiving jobs.
-- A change to `scheduler_type` or to the cluster's credentials takes effect without a restart: the controller refreshes its cached `Cluster` and rebuilds the cluster's client. Once Phase 2 ships, marking and unmarking also start and stop the cluster's Kueue watches.
+- A failed health probe marks the cluster not Ready, and placement considers only Ready clusters, `cluster_only`'s default choice included; an affinity pin is honored as today. Today the failure is discarded and `cluster_only` ignores readiness, so an unreachable cluster keeps receiving jobs.
+- A change to `scheduler_type` or to the cluster's credentials takes effect without a restart: the controller refreshes its cached `Cluster` and rebuilds the cluster's client. A token or CA rotated in place changes no `Cluster` field, so the first call it rejects (401 or a certificate error, at most one 30 s health probe later) rebuilds the client, and 0f retries a rejected create. Once Phase 2 ships, marking and unmarking also start and stop the cluster's Kueue watches.
 - *Why:* marking is the per-cluster rollout and rollback, token rotation (RFC-20260805) must not need a restart, and readiness is the signal re-placement (0f) and Phase 2 rely on.
 
 **0f. Dispatch: retry, re-place or fail (P5).**
@@ -279,7 +280,7 @@ RFC-20260805 keeps Kueue's alpha `SparkApplicationIntegration` gate, and the Spa
 
 ## APIs and CRDs
 
-There are no proto or CRD changes. The new controllermgr keys sit under the tree michelangelo#1985 added. When a key is absent, today's behavior holds; unknown values fail at startup.
+There are no proto or CRD changes. The new controllermgr keys sit under the tree michelangelo#1985 added. An absent key keeps today's behavior, with two deliberate exceptions for jobs bound for Kueue: `trustProjectLabel` defaults to false, so the namespace names the project (0c), and `admissionTimeout` to 24h (0a). Unknown values fail at startup.
 
 ```yaml
 jobs:
@@ -339,7 +340,7 @@ Within that range, `waitForPodsReady` is opt-in before Kueue 0.19, so 0a's backs
 
 | Phase | Ships | Gate | Rollback | Done when |
 |---|---|---|---|---|
-| 0 | 0a–0f, in the control plane and the Uniflow Ray plugin | 0e and 0f's retry apply everywhere. The rest is inert unless `backend: kueue` is set and a cluster is marked. | Unmark clusters | In e2e with a scaled-down budget: a job whose admission wait exceeds its provisioning budget is admitted and succeeds, a never-ready cluster fails within its budget, a Kueue restart during submission fails no job, and an unreachable cluster stops receiving jobs |
+| 0 | 0a–0f, in the control plane and the Uniflow Ray plugin | 0e, 0f's retry and the provisioning budget under Temporal apply everywhere. The rest acts only with `backend: kueue` or on a marked cluster. | Unmark clusters | In e2e with a scaled-down budget: a job whose admission wait exceeds its provisioning budget is admitted and succeeds, a never-ready cluster fails within its budget, a Kueue restart during submission fails no job, and an unreachable cluster stops receiving jobs |
 | 1 | RFC-20260805's charts on Kueue-managed clusters, with each project's LocalQueues | Inert until a cluster is marked | Unmark, which is non-destructive | A project without a LocalQueue gets `KueueQueueNotFound`; with one, its job is admitted |
 | 2 | Watches, `kueue_aware_shadow`, `kueue_aware` | Opt-in, shadow first | Strategy back to `cluster_only` (restart); assigned jobs stay put | The success criterion above |
 | 3 | The Spark contract, with federated Spark dispatch | The gate, per cluster | Unmark the cluster, let held applications drain, then turn the gate off | A labeled SparkApplication is held, admitted and succeeds, and dynamic allocation in `spark_conf` is rejected |
