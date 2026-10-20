@@ -1,326 +1,386 @@
-# RFC-20260805: Compute Cluster Helm Chart (`michelangelo-compute`)
+# RFC-20260805: Compute Cluster Helm Charts
 
 - **Status:** Draft
 - **Author(s):** @dragod812
 - **Created:** 2026-08-05
+- **Revised:** 2026-10-20
 
 ---
 
+## Summary
+
+Two Helm charts turn a Kubernetes cluster into a Michelangelo compute target for Ray and Spark:
+
+| Chart | Installs | Where |
+|---|---|---|
+| `michelangelo-compute` | The KubeRay operator, the Kubeflow Spark Operator and, optionally, Kueue; the identity the control plane authenticates as; the runtime objects that Ray and Spark pods read | Every compute cluster |
+| `michelangelo-compute-queues` | The cluster's Kueue queue objects: ResourceFlavor, ClusterQueue, LocalQueues | Kueue-managed clusters, after the first chart |
+
+The charts are the install path for compute clusters, in the sandbox and in production, released at the platform's coordinated version ([RFC-20260616](../20260616-release-process/20260616-release-process.md)). [RFC-20260427](../20260427-michelangelo-helmchart/20260427-michelangelo-helmchart.md) gave the control plane its chart; this RFC gives compute clusters theirs.
+
 ## Problem statement
 
-RFC-20260427 gave the Michelangelo **control plane** a Helm chart; the **compute side** still has none. Preparing a Kubernetes cluster to run Michelangelo batch workloads — Ray *and* Spark — today means assembling the pieces by hand:
+Preparing a compute cluster today means assembling five pieces by hand (as of `main`):
 
-1. **KubeRay operator** — installed imperatively by the sandbox (`helm install kuberay-operator ... --version 1.4.2`) with the version pinned inside Python code.
-2. **Spark Operator** — installed imperatively by the sandbox (`helm upgrade --install spark-operator spark-operator/spark-operator`) with **no version pin at all**, and only on the control-plane cluster. A dedicated compute cluster provisioned by `--create-compute-cluster` gets KubeRay, a ConfigMap and a credentials Secret, and no Spark Operator — so today a compute cluster is a Ray-only target.
-3. **Control-plane identity RBAC** — the `ray-manager` ServiceAccount + ClusterRole + ClusterRoleBinding the control plane authenticates as, `kubectl apply`'d from a raw manifest buried in `python/michelangelo/cli/sandbox/resources/`. Its comment says "ClusterRole for Spark/Ray jobs across namespaces"; its rules grant `ray.io` only.
-4. **Kueue** — since [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985) the control plane has an opt-in Kueue admission backend, and the operator guide asks operators to `helm install kueue` on each Kueue-managed cluster and `kubectl apply` a ClusterQueue plus one LocalQueue per project by hand; the sandbox scripts the same sequence for k3d (`ma sandbox demo kueue`).
-5. **Manual doc steps** — the compute-cluster registration guide walks the same objects by hand for non-sandbox clusters, as a parallel implementation that can (and has) drifted from what the sandbox actually does.
-
-The compounding symptoms:
-
-- **No versioned install unit.** There is no artifact an operator can `helm install`, `helm upgrade`, diff, or roll back on a compute cluster. Upgrading means "re-run the right commands in the right order" — and for the Spark Operator, whatever version the chart repo serves that day.
-- **No home for new per-cluster components.** Kueue adds an operator Deployment, a manager `Configuration`, and queue custom resources with a webhook-ordering constraint to every Kueue-managed cluster; RFC-20260731's Spark phase adds a Spark Operator version floor and a service-account contract. Sequencing that imperatively per cluster multiplies the fragility.
-- **Adopters fork.** With no chart to install, anyone running Michelangelo on their own compute clusters ends up writing one — an umbrella chart with KubeRay, Spark Operator and Kueue subcharts, control-plane identity RBAC, and chart-templated queue objects. That work is identical for every adopter, and none of it flows back.
-
-## Motivation
-
-Two forcing functions arrived together. The Kueue backend on `main` expects each Kueue-managed compute cluster to carry Kueue, a ClusterQueue, and per-project LocalQueues in a fixed namespace, with ordering dependencies and per-cluster configuration (quotas); and RFC-20260731 extends the same stack to multi-cluster placement and to Spark, where the Spark Operator's version and service-account naming become part of the contract. Packaging all of it once, declaratively, is strictly cheaper than teaching the sandbox, the docs, and every adopter's provisioning pipeline the same sequence independently.
-
-The pattern is well established — an umbrella chart is how a Kubernetes platform normally ships a set of components that must be installed together, in order, with per-cluster configuration. Providing one removes the incentive for per-adopter forks and completes the symmetry started by RFC-20260427 — one chart per cluster role:
-
-| Cluster role | Chart | RFC |
+| Piece | Today | Problem |
 |---|---|---|
-| Control plane | `helm/michelangelo` | RFC-20260427 |
-| Compute | `helm/michelangelo-compute` | this RFC |
+| KubeRay operator | `sandbox.py` runs `helm install kuberay-operator --version 1.7.1`; the KubeRay migration guide shows the command unpinned. | The version lives in Python, and the docs already disagree with it. There is no unit to upgrade or roll back. |
+| Spark Operator | The sandbox installs it unpinned, and only on the control-plane cluster. | The version floats. Dedicated compute clusters cannot run Spark. |
+| Control-plane identity | `rbac-ray.yaml` is applied raw: a cluster-wide grant on `ray.io` only. The guide mints a non-expiring token Secret; the sandbox mints a 10-year token. | No Spark grant and no Kueue read access, so the Kueue backend's LocalQueue check is denied ([RFC-20260731](../20260731-kueue-integration/20260731-kueue-integration.md), P5). The grant spans every namespace although the control plane uses one. There are two token procedures. |
+| Kueue and queue objects | The guide runs `helm install kueue --version 0.15.0`, then `kubectl apply`; `ma sandbox demo kueue` installs the same version. Both keep upstream defaults. | The guide's queue covers only CPU and memory, so a Ray job that sets a disk size (ephemeral storage) is never admitted. 0.19's defaults, which RFC-20260731 needs, also put Kueue's fail-closed webhook in front of every Pod create outside `kube-system` and Kueue's namespace. |
+| Runtime objects | The sandbox and the guide create a `michelangelo-config` ConfigMap (storage credentials inside) and an `aws-credentials` Secret on compute clusters. | See below. |
 
-Because the sandbox provisions its compute clusters through the same chart, the artifact operators install is exercised end-to-end by CI and by every developer sandbox — sandbox, docs, and production converge on one definition of "a Michelangelo compute cluster."
+The runtime objects fail in three ways:
+
+- Log persistence is on by default. The collector sidecar on every Ray pod then reads the Secret named by controllermgr's `logPersistence.credentialsSecret`, through a non-optional reference. Neither the sandbox nor the guide creates that Secret on a dedicated compute cluster, so every Ray pod there fails with `CreateContainerConfigError`.
+- Storage credentials sit in a ConfigMap.
+- `REGISTRY_ENDPOINT` names a control-plane Service that does not resolve from another cluster.
+
+Nothing ties these pieces together, so every adopter re-derives the sequence, and the guide has already drifted from the sandbox.
 
 ## Goals
 
-- Two `helm upgrade --install` commands prepare any Kubernetes ≥1.27 cluster as a Michelangelo compute target for **both Ray and Spark**: KubeRay operator, Spark Operator, Kueue with the RayCluster (and, where supported, SparkApplication) integration, the cluster's queue objects, and the control-plane identity RBAC.
-- The sandbox provisions every compute cluster (and the control-plane cluster when it doubles as one) through the chart — no raw compute-side manifests left in `sandbox.py`'s resources, and no unpinned operator installs.
-- Default rendering is behavior-identical to the manifests and imperative installs it replaces (field-for-field, apart from standard chart labels), so existing sandboxes see no change.
-- The values operators actually need are first-class: queue names and quotas (`kueueQueues.*`), the per-project LocalQueue list, the Spark job namespaces and service-account name, and subchart toggles (`kuberay-operator.enabled`, `spark-operator.enabled`, `kueue.enabled`) for clusters where an operator is already managed out-of-band.
-- A CI gate lints and template-renders every supported profile on every chart change.
+1. One `helm upgrade --install` prepares a cluster to run Ray and Spark workloads dispatched by the control plane; a second one makes it Kueue-managed.
+2. The sandbox provisions every cluster that runs Ray or Spark workloads through these charts, leaving no raw compute-side manifests or unpinned operator installs in `sandbox.py`.
+3. Values that would break the control-plane contract fail at render time.
+4. The charts are versioned, published and tested like the platform's other charts, including install, upgrade and uninstall.
 
 ## Non-goals
 
-- **Registration glue.** Minting the `ray-manager` token, and creating the `Cluster` CR (including its `scheduler_type`) plus the per-cluster CA/token Secrets **on the control plane**, stays in the operator guide. This boundary does *not* cleanly cover the object-storage credentials that Ray and Spark pods consume **on the compute side**; see Cross-cluster coupling below, which is unresolved.
-- **The NVIDIA GPU stack.** Drivers, device plugin, and MIG tooling are cluster infrastructure (e.g. the NVIDIA GPU Operator), not chart contents.
-- **Serving/online workloads and control-plane components** — batch (Ray and Spark) only; the control plane is RFC-20260427's chart.
-- **Queueing and placement semantics.** What Kueue does, how the control plane resolves a project to a LocalQueue, and Kueue-aware assignment are RFC-20260731's (and michelangelo#1985's) scope; this RFC covers only how the cluster-side pieces are packaged and installed.
-- **Publishing the chart to a registry** (install-from-source for now; see Open questions).
+- **Registration.** Creating the `Cluster` CR and its CA and token Secrets on the control plane, and setting `scheduler_type`, stays in the registration guide. Bounded-lifetime tokens would need the control plane to refresh credentials; [enhancements#20](https://github.com/michelangelo-ai/enhancements/pull/20) does not change this credential.
+- **Workload identity for object storage** (IRSA, GKE Workload Identity). The collector reads static keys from a Secret; changing that is a control-plane change.
+- **Multi-flavor queues, cohorts, per-project quota and preemption.** Clusters that need them author queue objects directly. RFC-20260731 placement ranks multi-flavor and cohort queues by queue depth.
+- **The NVIDIA GPU stack** (drivers, device plugin, MIG), serving workloads and control-plane components.
+- **Queue semantics,** which belong to RFC-20260731.
 
-## High-level architecture
+## Design
 
 ```mermaid
 flowchart LR
     subgraph cp["Control-plane cluster"]
-        direction TB
-        cpchart["helm/michelangelo (RFC-20260427)"]
         cm["controllermgr<br/>authenticates as ray-manager"]
-        cpchart --> cm
     end
-
-    subgraph cc["Compute cluster (x N)"]
+    subgraph cc["Compute cluster × N"]
         direction TB
-        subgraph chart["helm/michelangelo-compute (this RFC, one release namespace)"]
-            kuberay["kuberay-operator subchart"]
-            spark["spark-operator subchart<br/>(≥ 2.4.0)"]
-            kueue["kueue subchart (0.15 line, v1beta2)<br/>frameworks: batch/job, ray.io/raycluster<br/>[+ sparkoperator.k8s.io/sparkapplication]"]
-            queues["kueueQueues templates<br/>ResourceFlavor / ClusterQueue /<br/>LocalQueue per project / priority classes"]
-            rbac["ray-manager SA + ClusterRole + binding<br/>ray.io + sparkoperator.k8s.io (ns: default)"]
+        subgraph rel["ns michelangelo-compute"]
+            r1["release michelangelo-compute<br/>kuberay-operator 1.7.1 · spark-operator 2.5.2 · kueue 0.19.9 (opt-in)"]
+            r2["release michelangelo-compute-queues<br/>(Kueue-managed clusters only)"]
         end
-        rc["rayv1.RayCluster CRs + pods (ns: default)"]
-        sa["SparkApplication CRs + pods<br/>(ns: spark.jobNamespaces)"]
+        subgraph def["ns default — the dispatch namespace"]
+            id["ray-manager ServiceAccount, Role, token Secret"]
+            rt["michelangelo-config · object-storage credentials Secret"]
+            lq["LocalQueues ma-&lt;project&gt;"]
+            w["RayClusters · SparkApplications"]
+        end
+        cq["ResourceFlavor · ClusterQueue (cluster-scoped)"]
     end
-
-    cm -->|"creates/manages Ray and Spark CRs<br/>via ray-manager identity"| rc
-    cm -->|"RFC-20260731 Phase 3"| sa
-    kueue -->|"quota admission<br/>(queue objects)"| rc
-    kueue -.->|"Kueue ≥ 0.17"| sa
-    kuberay -->|"reconciles"| rc
-    spark -->|"reconciles"| sa
+    cm -->|"create · get · delete"| w
+    r1 -.-> id & rt
+    r2 -.-> lq & cq
+    lq --> cq
 ```
 
-### Chart layout
+### Components and pins
 
-```
-helm/michelangelo-compute/
-├── Chart.yaml              # kuberay-operator + spark-operator + kueue dependencies (condition-gated)
-├── Chart.lock              # committed; charts/*.tgz resolved at install time
-├── values.yaml
-├── README.md               # install + full values table + version floors
-└── templates/
-    ├── _helpers.tpl
-    ├── NOTES.txt            # per-component status, phase-2 reminder, verify commands
-    ├── rbac/
-    │   └── ray-manager.yaml # SA + ClusterRole + ClusterRoleBinding (rayManager.create)
-    └── kueue/
-        ├── resource-flavor.yaml     # all gated by kueueQueues.enabled
-        ├── cluster-queue.yaml
-        ├── local-queues.yaml        # one LocalQueue per kueueQueues.localQueues entry
-        └── priority-classes.yaml    # optional WorkloadPriorityClass set
-```
+| Subchart | Pin | Why this version | Toggle (default) |
+|---|---|---|---|
+| `kuberay-operator` | 1.7.1 | It is what the sandbox runs today (michelangelo#2200), and it matches the History Server collector (v1.7) that controllermgr injects. Kueue's RayCluster integration needs ≥ 1.1.0. | `kuberay-operator.enabled` (`true`) |
+| `spark-operator` (Kubeflow) | 2.5.2 | The latest release when this RFC was written. The floor is 2.4.0, which added the `spec.suspend` that Kueue requires. | `spark-operator.enabled` (`true`) |
+| `kueue` | 0.19.9 | The 0.19 line supports Kubernetes ≥ 1.29 and carries the Spark fixes RFC-20260731 depends on. 0.20 officially supports only Kubernetes ≥ 1.34 and stops serving `v1beta1`, so the pin moves to it, raising the chart's `kubeVersion`, when 0.19 stops receiving patches. | `kueue.enabled` (`false`) |
 
-Subcharts are declared with `condition:` flags and resolved via `--dependency-update` (the `Chart.lock` is committed; tarballs are not vendored). Pins:
+Pins are exact and `Chart.lock` is committed. The published chart bundles its pinned subcharts, so installs need no upstream chart repository. Images still come from upstream registries, and air-gapped installs override each subchart's image repository. The chart declares `kubeVersion: ">=1.29.0-0"`, Kueue 0.19's floor, even with Kueue off, so that turning Kueue on stays a values change rather than a cluster upgrade; the other subcharts declare none.
 
-- **kuberay-operator** — `1.4.2`, the version the sandbox installs imperatively today, now declared in one place. Note the skew worth closing: the control plane already builds against `ray-operator` Go types `v1.5.0`, while the sandbox runs operator `1.4.2` and the chart line is at `1.7.x`. The chart pin should track the Go types' minor, with the bump landing as a normal chart-version change rather than a Python edit.
-- **spark-operator** (Kubeflow, `https://kubeflow.github.io/spark-operator`) — pinned to a released `2.x` chart, **≥ 2.4.0** because that release added `spec.suspend`, which Kueue's SparkApplication integration requires. Today the sandbox pins nothing.
-- **kueue** (`oci://registry.k8s.io/kueue/charts`) — the **0.15 line**, the first that serves `kueue.x-k8s.io/v1beta2` and the version `ma sandbox demo kueue` already installs. Note the version string carries **no `v` prefix**: the OCI registry publishes `0.15.0`, and `--version v0.15.0` fails to resolve; declaring the pin in `Chart.yaml` retires that footgun.
+**One release of each chart per cluster,** named after the chart, in namespace `michelangelo-compute`:
 
-#### Kueue version floor, not pin exit plan
+- One release, because the charts render cluster-scoped objects and fixed names (KubeRay's `fullnameOverride`, the identity), so a second release would collide.
+- A dedicated namespace, because none of the subcharts can be installed into a namespace of its own, so the release namespace holds all three operators and naming it after one of them would mislead.
 
-An earlier draft of this RFC pinned Kueue to `0.10.6` (serving `v1beta1`) because the control plane was expected to vendor a `sigs.k8s.io/kueue` Go client, whose version is tied to the repo's `k8s.io/*` libraries — and then spent a section on how to escape that pin. That constraint no longer exists. The backend that landed in michelangelo#1985 talks to Kueue with a raw `GET` against `kueue.x-k8s.io/<apiVersion>` (default `v1beta2`, configurable as `jobs.scheduler.kueue.apiVersion`), and RFC-20260731's informers keep the same property through the dynamic client. The control plane pins no Kueue module, so the chart's Kueue version is a compute-side decision made on compute-side grounds:
-
-- **Floor: 0.15.** First release serving `v1beta2` (upstream has deprecated `v1beta1` and is retiring it in the 0.20 line), and it carries the RayJob `clusterSelector` skip ([kueue#7218](https://github.com/kubernetes-sigs/kueue/issues/7218)) that both this chart's `frameworks` narrowing and the control plane's "never label RayJobs" rule rely on.
-- **0.17+ for Spark gating.** Kueue's `sparkoperator.k8s.io/sparkapplication` integration arrived in 0.17 behind the alpha `SparkApplicationIntegration` feature gate; RFC-20260731's Phase 3 needs it. The chart exposes the gate and the framework entry as values; below 0.17 they are simply absent and Spark on that cluster is admitted immediately.
-- **Cadence.** Track the newest 0.x line that has a patch release, bumping as an ordinary chart change; adopters already running a newer Kueue set `kueue.enabled=false` and take the operators, RBAC, and queue objects from this chart — which the subchart toggles permit, and which is the interim answer for any pin.
-
-### Values interface
+### `michelangelo-compute` values
 
 ```yaml
-rayManager:                       # identity the control plane uses on this cluster
-  create: true                    # false if managed out-of-band
-  serviceAccountName: ray-manager # name is registration-facing; kept for continuity
-  namespace: default              # must match where the control plane creates Ray resources
-  clusterRoleName: ray-manager
-  clusterRoleBindingName: ray-manager-binding
+rayManager:                          # the identity the control plane authenticates as
+  create: true
+  name: ray-manager                  # names the identity objects (Control-plane identity)
+  tokenSecret: true                  # renders ray-manager-token (type kubernetes.io/service-account-token)
   grants:
-    ray: true                     # ray.io: rayclusters, rayjobs
-    spark: true                   # sparkoperator.k8s.io: sparkapplications (RFC-20260731 Phase 3)
+    spark: false                     # true from the release that ships federated Spark dispatch
+    kueueRead: true
 
-kuberay-operator:
-  enabled: true                   # false when the operator is already on the cluster
-  # any upstream kuberay-operator chart value nests here
+runtime:                             # read by every pod the control plane creates here (ns default)
+  config: {}                         # → ConfigMap michelangelo-config, rendered verbatim; MA_FILE_SYSTEM,
+                                     #   AWS_ENDPOINT_URL and REGISTRY_ENDPOINT required, the Secret's two keys rejected
+  objectStorageCredentials:          # → Secret with keys AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+    name: ""                         # required: controllermgr's logPersistence.credentialsSecret
+    create: false                    # true: render it from the keys below (sandbox, dev); false: managed elsewhere
+    accessKeyId: ""
+    secretAccessKey: ""
 
+kuberay-operator: {enabled: true}
 spark-operator:
   enabled: true
   spark:
-    jobNamespaces: ["default"]    # every namespace SparkApplications are created in; "" = all
-    serviceAccount:
-      name: spark-operator-spark  # pinned: the control plane hardcodes this driver SA name
+    jobNamespaces: [default]
+    serviceAccount: {name: spark-operator-spark}
+  webhook:
+    replicas: 2
+    podDisruptionBudget: {enable: true, minAvailable: 1}
 
 kueue:
-  enabled: true
+  enabled: false                     # opt in per cluster, together with scheduler_type on its Cluster CR
+  controllerManager:
+    replicas: 2
+    podDisruptionBudget: {enabled: true, minAvailable: 1}
+    featureGates: []                 # SparkApplicationIntegration: on by default from the release
+                                     #   that ships federated Spark dispatch
   managerConfig:
-    controllerManagerConfigYaml: |-   # full Configuration override; the intentional change
-      ...                             # vs upstream defaults is integrations.frameworks,
-                                      # narrowed to ["batch/job", "ray.io/raycluster"]
-                                      # (+ "sparkoperator.k8s.io/sparkapplication" on ≥ 0.17)
-
-kueueQueues:
-  enabled: false                  # phase-2 gate — see two-phase install below
-  flavorName: default-flavor
-  clusterQueueName: cluster-queue
-  quota:                          # keys also derive the ClusterQueue's coveredResources
-    cpu: 16
-    memory: 32Gi
-    nvidia.com/gpu: 4
-  localQueueNamespace: default    # where the control plane dispatches workloads (RayLocalNamespace)
-  localQueues: []                 # one per project, e.g. ["ma-california-housing", "ma-bert-cola"]
-  priorityClasses: []             # optional WorkloadPriorityClass set, e.g. [{name: high, value: 1000}]
+    controllerManagerConfigYaml: |   # upstream's default Configuration, plus these deltas:
+      managedJobsNamespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: default}
+      integrations:
+        frameworks: ["ray.io/raycluster"]   # + "sparkoperator.k8s.io/sparkapplication" with the gate
+      waitForPodsReady:
+        timeout: 1h
+        recoveryTimeout: 0s
+        requeuingStrategy: {backoffLimitCount: 2}
+      resources: {excludeResourcePrefixes: ["ephemeral-storage"]}
 ```
 
-Six contract details worth calling out:
+The dispatch namespace is fixed at `default`, because the control plane creates every RayCluster there (`RayLocalNamespace`, a constant), and RFC-20260731 Phase 3 does the same for SparkApplications. Making it configurable later is an additive change.
 
-- **`kueueQueues.quota` keys derive `coveredResources`.** Adding a key both covers and quotas that resource; a workload requesting an uncovered resource stays suspended. Deriving one list from the other keeps them impossible to de-sync.
-- **Partial quota overrides compose.** Helm deep-merges user values over defaults, so `--set kueueQueues.quota.cpu=64` (or a `-f` values file) changes CPU while memory/GPU keep chart defaults — the mechanism RFC-20260731's multi-cluster sandbox uses for per-cluster quotas.
-- **Dotted resource keys need escaping with `--set`.** Helm reads `.` as a path separator, so `--set kueueQueues.quota.nvidia.com/gpu=8` silently builds a nested `nvidia: {com/gpu: 8}` map and leaves the real GPU quota at its default. The accelerator key must be escaped (`--set 'kueueQueues.quota.nvidia\.com/gpu=8'`) — which is why the sandbox passes per-cluster quotas as a generated `-f` values file rather than `--set`, and why operators should prefer values files too.
-- **LocalQueues are a list, named by the control plane's convention.** The Kueue backend resolves a job's project to `ma-{project}` (`jobs.scheduler.kueue.localQueueTemplate`) and validates that queue exists in the dispatch namespace before dispatch. The chart therefore renders one LocalQueue per `kueueQueues.localQueues` entry, all in `localQueueNamespace`, all pointing at the cluster's ClusterQueue. An empty list is valid: it means per-project queues are authored elsewhere — for example the per-project LocalQueue reference that RFC-20260731 places next to each project's `project.yaml` in `michelangelo-examples`. Either path produces the identical object.
-- **The Spark service-account name is a cross-chart contract.** The upstream chart names the driver ServiceAccount `<release>-spark`, which is `spark-operator-spark` only when the release is literally named `spark-operator` — and the control plane hardcodes that name on every SparkApplication it creates. Under an umbrella release the name would silently change, so the chart pins `spark.serviceAccount.name`. Likewise the operator reconciles SparkApplications only in `spark.jobNamespaces`, and the control plane creates them in the job's own namespace, so that list must cover every project namespace that runs Spark (or be `[""]` for all).
-- **The `frameworks` override narrows the upstream default; it does not extend it.** Upstream's 0.15 chart enables twelve integrations out of the box (`batch/job`, `ray.io/raycluster`, `ray.io/rayjob`, `jobset`, `trainjob`, `appwrapper`, and six Kubeflow v1 kinds). Setting `frameworks: ["batch/job", "ray.io/raycluster"]` therefore *disables* ten of them — deliberately, because Kueue should only gate workload kinds the control plane stamps the queue label on, and each enabled framework costs a webhook and controller on every compute cluster. `ray.io/rayjob` in particular stays off: the control plane never labels RayJobs (michelangelo#1985), and Kueue skips `clusterSelector` RayJobs regardless. The Spark framework is added by the same value when the cluster meets the 0.17 floor.
+**Enforced invariants.** Rendering fails if any of these is violated, as `helm/michelangelo-llm-gateway` does for its own invariants.
 
-### Two-phase install
+| Invariant | Why it is enforced rather than defaulted |
+|---|---|
+| `spark-operator.spark.serviceAccount.name` is `spark-operator-spark` | The control plane sets this driver ServiceAccount on every SparkApplication. Upstream derives the name from the release name, so an umbrella release silently changes it. |
+| `spark-operator.spark.jobNamespaces` contains `default` | The operator ignores SparkApplications in unlisted namespaces, and it renders the driver ServiceAccount and Role only for listed ones (`[""]`, "all namespaces", renders none). |
+| `runtime.config` sets the three settings and neither credential key | Each setting names something reachable from *this* cluster, so no default can be right. The two keys belong in the Secret. |
+| `objectStorageCredentials.name` is set, and the keys are set exactly when `create` is true | The name must match the control plane's. Keys enter Helm values (and the release Secret) only when the chart is asked to create the Secret. |
+| With `kueue.enabled`, the Configuration keeps the four deltas, and the Spark framework is listed only together with its gate | The deltas are what make Kueue safe to install here and consistent with RFC-20260731. Kueue refuses to start with the Spark framework listed but its gate off. |
 
-Kueue's queue objects are custom resources validated by Kueue's own webhook, so a fresh install cannot create the operator and the queue objects in one release pass — the CRDs must be established and the webhook serving first. Rather than hiding this in hooks, the chart makes it an explicit gate (`kueueQueues.enabled`, default `false`):
+### Kueue configuration
 
-```mermaid
-sequenceDiagram
-    participant I as Installer (operator or sandbox)
-    participant H as Helm
-    participant K as Compute cluster
+The deltas keep Kueue's webhooks out of every create path the contract does not need, and align Kueue's timers with the control plane's:
 
-    I->>H: helm upgrade --install ... --wait          (phase 1: queues off)
-    H->>K: KubeRay + Spark Operator + Kueue Deployments, CRDs, webhooks, ray-manager RBAC
-    K-->>H: Deployments Ready
-    I->>K: kubectl wait --for=condition=Established crd/{clusterqueues,localqueues,resourceflavors,workloadpriorityclasses}.kueue.x-k8s.io
-    I->>H: helm upgrade --install ... --set kueueQueues.enabled=true   (phase 2)
-    H->>K: ResourceFlavor + ClusterQueue + LocalQueues (+ priority classes), validated by the live webhook
-```
+- **Frameworks: only `ray.io/raycluster`**, plus the Spark framework once the gate is on. Kueue gates only the kinds the control plane labels.
+  - Disabling `pod`, `deployment` and `statefulset` switches their webhooks from `Fail` to `Ignore`, taking Kueue out of every other Pod create.
+  - `batch/job` and `ray.io/rayjob` stay off. The control plane creates no Jobs on compute clusters and never labels RayJobs.
+- **`managedJobsNamespaceSelector`: only `default`.** The chart derives every job webhook's namespace selector from this field. Those webhooks are `Fail` whether or not their integration is enabled; Kueue answers for disabled integrations with a no-op. Scoping confines Kueue's availability dependency to the dispatch namespace.
+- **`waitForPodsReady`: a 1 h timeout, no recovery eviction, at most two requeues.** Kueue 0.19 always runs it: by default, after 30 minutes without ready pods it evicts the workload and requeues it, endlessly.
+  - RFC-20260731 Phase 0 bounds provisioning itself (default 30 minutes, cumulative across evictions). Kueue's timeout is therefore only a backstop. It must exceed the longest provisioning budget in use; one hour is twice the default.
+  - `backoffLimitCount: 2` ends the cycle for consumers that have no provisioning budget. After a third failed start Kueue deactivates the workload, which then stays suspended until RFC-20260731's admission bound deletes it. Two requeues absorb a transient cause, such as a slow image pull or a replaced node.
+  - `recoveryTimeout: 0s` stops Kueue from evicting a running cluster that has lost a pod. KubeRay replaces the pod, whereas an eviction would delete the head and kill the job.
+- **`resources.excludeResourcePrefixes: ["ephemeral-storage"]`.** Kueue blocks any workload that requests a resource its ClusterQueue does not cover. Ray pods request ephemeral storage whenever a task sets a disk size, and node-local disk is not something the platform rations by quota. Every other undeclared resource still blocks, so a GPU job is never admitted to a queue without GPU quota.
+- **Two replicas with a PDB, for Kueue and for the Spark Operator's webhook.** Every replica serves webhooks. With one replica, a restart or node drain blocks the creation of RayClusters, SparkApplications or Spark pods in `default`. The operators' controllers stay single-replica, because a controller restart delays reconciliation but does not block creation. RFC-20260731 Phase 0f retries the transient create errors that remain.
+- **`kueue.enabled` defaults to `false`.** Kueue is opt-in per cluster in the merged backend, and installing it on a cluster that will not be marked adds a fail-closed webhook and buys nothing. `manageJobsWithoutQueueName` keeps upstream's `false`, so a cluster with Kueue installed but not yet marked admits everything immediately.
 
-The explicit `kubectl wait` exists because Helm's `--wait` only covers the Deployments, not CRD establishment. Both phases are idempotent `helm upgrade --install` calls; re-running either is safe. Adding a project later is a phase-2 re-run with one more `localQueues` entry.
+The subchart replaces its Configuration wholesale, so the chart carries Kueue's full default with these deltas. CI fails if anything outside the deltas differs from the pinned subchart's default, which catches upstream changes at every Kueue bump. With `kueue.enabled=false`, an existing Kueue can be used if it serves `v1beta2` (≥ 0.15) and carries the same deltas.
 
-### Namespace and lifecycle consequences
-
-Two properties of the upstream Kueue chart shape how this one behaves in production; both hold on the 0.15 line (CRDs under `templates/crd/`, namespaced references through `.Release.Namespace`).
-
-**One release namespace for three operators.** None of the three subcharts offers a namespace override, so an umbrella release installs KubeRay, the Spark Operator, and Kueue into the release namespace. The chart keeps `ray-system` as the default for continuity with the registration guide and every existing sandbox; the cost is muscle memory, since Kueue's docs (and the merged operator guide and `ma sandbox demo kueue`) say `-n kueue-system` and the Spark Operator's say `-n spark-operator`, so those commands come back empty here. NOTES.txt prints namespace-correct verify commands, and the operator guides should use the release namespace throughout. Operators who need the upstream layout set the corresponding subchart `enabled=false` and install it standalone.
-
-**Kueue's CRDs are release-managed, which cuts both ways.** The chart ships its CRDs in `templates/crd/` rather than Helm's special `crds/` directory:
-
-- *Upside:* `helm upgrade` reconciles CRD schema changes like any other manifest, so this chart avoids the standard Helm trap where `crds/` is install-only and silently drifts across upgrades. A Kueue minor bump is a normal chart upgrade.
-- *Downside:* `helm uninstall` **deletes the CRDs**, and deleting a CRD cascades to every object of that kind. Uninstalling on a live cluster removes every `Workload`, `ClusterQueue`, and `LocalQueue` on it, discarding admission state for running jobs. Uninstall is a cluster-drain operation, not a no-op — see Rollback.
-
-The Spark Operator subchart ships a mutating webhook (enabled upstream by default) that the Kueue SparkApplication integration also depends on for suspend/resume; it is left enabled.
-
-### Cross-cluster coupling: object-storage credentials
-
-One compute-side dependency does not fit the "chart prepares the compute side, guide does the registration" split cleanly, and it is worth resolving before this chart is called complete.
-
-Ray log persistence is **on by default** (`controllermgr.jobs.k8sengine.mapper.logPersistence.enabled: true` in the control-plane chart). When enabled, controllermgr injects a `kuberay-collector` sidecar into every RayCluster head and worker pod, and that sidecar reads its S3 credentials through a `secretKeyRef`:
+### Queue objects: `michelangelo-compute-queues`
 
 ```yaml
-# rendered by controllermgr into every Ray pod, on the COMPUTE cluster
-env:
-  - name: AWS_S3ID
-    valueFrom:
-      secretKeyRef:
-        name: <controllermgr's jobs.k8sengine.mapper.logPersistence.credentialsSecret>
-        key: AWS_ACCESS_KEY_ID       # and AWS_SECRET_ACCESS_KEY for AWS_S3SECRET
+clusterQueueName: cluster-queue
+flavorName: default-flavor
+quota: {}                            # required, e.g. {cpu: 64, memory: 256Gi, nvidia.com/gpu: 8}
+localQueues: []                      # full names, e.g. [ma-california-housing]
+priorityClasses: []                  # optional WorkloadPriorityClasses, e.g. [{name: low, value: 100}]
 ```
 
-`credentialsSecret` defaults, control-plane-side, to `michelangelo.objectStorageSecretName` — `<release>-object-storage-credentials` — and the Secret of that name is templated by **`helm/michelangelo`**, so it exists only where the control-plane release is installed. A `secretKeyRef` is a *local* object reference: it resolves in the Ray pod's own namespace, on the compute cluster. The consequences:
+This renders:
 
-- **Single-cluster sandbox:** works, but only coincidentally — control plane and compute cluster are the same cluster and namespace, so the Secret happens to be present.
-- **Dedicated compute cluster:** nothing provisions it. `_create_compute_cluster` creates a Secret named `aws-credentials` with a single opaque `credentials` key (AWS-CLI ini format) — a different name *and* a different key shape — plus a `michelangelo-config` ConfigMap that Ray pods `envFrom`. Every Ray pod therefore fails with `CreateContainerConfigError` and never starts.
+```yaml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata: {name: default-flavor}               # empty spec: no node labels or taints
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata: {name: cluster-queue}
+spec:
+  namespaceSelector:
+    matchLabels: {kubernetes.io/metadata.name: default}
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+  - coveredResources: [cpu, memory, nvidia.com/gpu]   # the quota keys
+    flavors:
+    - name: default-flavor
+      resources:
+      - {name: cpu, nominalQuota: 64}
+      - {name: memory, nominalQuota: 256Gi}
+      - {name: nvidia.com/gpu, nominalQuota: 8}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata: {name: ma-california-housing, namespace: default}
+spec: {clusterQueue: cluster-queue}
+```
 
-Spark widens the same gap: driver and executor pods read S3 through Hadoop's credential chain and the same `michelangelo-config` endpoint, so a Spark-capable compute cluster needs the same two objects. This is a name contract spanning two charts on two clusters, with the producer on one side and the consumer on the other. The compute chart is the only compute-side artifact in the design, which makes it the natural owner — templating an `objectStorage.credentials` Secret and the `michelangelo-config` ConfigMap next to `rbac/ray-manager.yaml`, keyed `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, with the name defaulted to match controllermgr's default and overridable for operators who set `credentialsSecret` explicitly. Whether the chart should own it, or whether log persistence should be documented as opt-in for multi-cluster installs, is an Open question — but the current split leaves a default-on configuration broken on exactly the topology this chart exists to serve.
+Why each choice:
+
+- **`BestEffortFIFO`** (Kueue's default). A large workload at the head of the queue does not block smaller ones that fit.
+- **`namespaceSelector` matches only `default`.** Only LocalQueues in the dispatch namespace draw on Michelangelo's quota; a LocalQueue pointed at it from elsewhere stays inactive.
+- **One flavor; no cohort, borrowing or preemption.** This matches what RFC-20260731 can score, and preemption would evict running clusters.
+- **`quota` is required.** Quota is capacity, and no default is universally right: too low wastes the cluster, too high defeats Kueue. The schema requires scalar values, so the nested map that an unescaped `--set quota.nvidia.com/gpu=8` builds fails rendering instead of silently dropping the GPU quota.
+- **Each LocalQueue name is managed by `localQueues` or by hand, never both.** Helm overwrites hand edits to the objects it renders, and deletes them when they leave `localQueues`.
+- **No priority classes by default.** Whether the control plane stamps them is open in RFC-20260731, and the default set ships with that decision. A stamped class that does not exist keeps the workload from being created.
+
+**Why a second chart rather than a toggle in the first.** Helm builds a release's whole manifest against the cluster's API before creating anything. Kueue ships its CRDs as templates, so queue objects cannot be in the release that installs those CRDs; a single chart would need two runs with different values on first install. A separate release also matches ownership and cadence: capacity owners and project onboarding change queues often, while operators change rarely. And GitOps tools can sequence two releases (Flux with `dependsOn`; Argo CD with sync waves on the two Applications of an app-of-apps).
+
+### Control-plane identity
+
+| Object | API group | Resources | Verbs | Why |
+|---|---|---|---|---|
+| Role `ray-manager` in `default` | `ray.io` | `rayclusters`, `rayjobs` | create, get, list, watch, update, patch, delete | Today's grant, narrowed to the namespace the control plane uses |
+| Same Role | `sparkoperator.k8s.io` | `sparkapplications` | Same as `ray.io` | Federated Spark dispatch (`grants.spark`) |
+| Same Role | `kueue.x-k8s.io` | `localqueues` | get, list, watch | The enqueue-time LocalQueue check, and RFC-20260731 Phase 2's watches (`grants.kueueRead`) |
+| ClusterRole `ray-manager-clusterqueues` | `kueue.x-k8s.io` | `clusterqueues` | get, list, watch | Phase 2's watches. ClusterQueues are cluster-scoped (`grants.kueueRead`) |
+
+A binding of the same name grants each to the ServiceAccount `ray-manager` in `default`. The cluster-scoped names differ from today's ClusterRole and binding, so both sets coexist while a cluster migrates.
+
+Why these grants:
+
+- **A Role, not today's ClusterRole.** Every call the control plane makes to a compute cluster targets `default`, and its health probe (`/healthz`) needs no grant. Per-project namespaces would replicate the Role.
+- **The `ray-manager` name predates Spark** and is kept because registration references it.
+
+**What a leaked token can do.** Its holder can create RayClusters (and, with `grants.spark`, SparkApplications) in `default`. That means running arbitrary images there, under any ServiceAccount in that namespace, mounting any Secret in it, the object-storage credentials included. It reaches nothing outside `default` except read access to ClusterQueues. `default` on a compute cluster should therefore hold only Michelangelo workloads and their runtime objects.
+
+**Token lifecycle.** `tokenSecret` renders `ray-manager-token`, which registration reads, replacing both of today's token procedures. The token does not expire. To rotate it, delete the Secret and re-run `helm upgrade`: the chart recreates it with a new token, and the old one stops validating at once. The control plane picks up the re-registered token without a restart, and retries creates rejected in between (RFC-20260731 0e, 0f), so a rotation completed within ten minutes fails no job. Anything that deletes the ServiceAccount (uninstall, `rayManager.create=false`) likewise invalidates the registered token.
+
+### Runtime contract
+
+Every pod the control plane creates on a compute cluster reads two objects in `default`:
+
+- **`michelangelo-config`,** rendered verbatim from `runtime.config`: the storage root, the object-storage endpoint and the model-registry endpoint, each reachable from this cluster, plus any other settings. It rejects only the two credential keys, because the chart cannot tell other secrets from settings; the tracking credentials the operator guides add still pass, and can move to the Secret.
+- **The object-storage credentials Secret** (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), named by controllermgr's `logPersistence.credentialsSecret`. One identity serves the collector sidecar and the task containers, so it needs access to both the log bucket and the storage root.
+  - controllermgr, which already names this Secret for the collector, attaches it whole to the Ray head and worker containers and the Spark driver and executor, whatever authored the job and whether or not log persistence is on. It is an optional `envFrom` source ahead of the ConfigMap: *optional*, so clusters without the Secret keep working; *ahead*, so a ConfigMap that still carries credentials keeps precedence and hand-built clusters see no change. This control-plane change ships with Phase A.
+  - The sandbox's model-sync DaemonSet, which also reads these keys from the ConfigMap, reads the Secret the same way.
+  - `create: false`, the production default, expects the Secret from the operator's secret management before the first job and keeps keys out of Helm values; `create: true` is for the sandbox and development. A rendered Secret carries `helm.sh/resource-policy: keep`, so neither uninstalling nor switching to `create: false` deletes credentials that running pods read.
+  - Where the control plane runs on the same cluster and already provides this Secret in `default` (the sandbox, or `helm/michelangelo` installed in `default`), `create` stays `false`, because two releases cannot own one object.
+
+`helm test michelangelo-compute` checks the contract from `default`: the Secret exists, and both endpoints are reachable. One coupling remains: controllermgr has a single `logPersistence.storageEndpoint`, which every compute cluster must reach.
+
+### Install, upgrade, uninstall
+
+**Install.**
+
+```sh
+helm upgrade --install michelangelo-compute oci://ghcr.io/michelangelo-ai/michelangelo/charts/michelangelo-compute \
+  --version "$VERSION" -n michelangelo-compute --create-namespace -f cluster.yaml --wait
+# Kueue-managed clusters (cluster.yaml sets kueue.enabled: true), once the first command has returned:
+helm upgrade --install michelangelo-compute-queues oci://ghcr.io/michelangelo-ai/michelangelo/charts/michelangelo-compute-queues \
+  --version "$VERSION" -n michelangelo-compute -f queues.yaml --wait
+```
+
+`--wait` returns once Kueue's CRDs are Established and its Deployment is Ready. With Kueue's internal certificate management (the default), Ready implies that its webhook certificates are in place, so the second release's objects pass validation; with cert-manager (`enableCertManager`), the CA bundle arrives asynchronously, and the second command may need a retry. Both commands are idempotent, and onboarding a project means appending to `localQueues` and re-running the second.
+
+**Upgrade.**
+
+- **Kueue** ships its CRDs as templates, so `helm upgrade` and `helm rollback` reconcile them.
+- **KubeRay and the Spark Operator** ship their CRDs in `crds/`, which Helm creates at first install, if absent, and never upgrades or rolls back. Wherever those CRDs may be older than the chart's (a first install over an existing operator, or a release that bumps either pin), they are applied first; otherwise the new operator runs on the old schema, and the API server silently drops every field it lacks:
+  - Helm CLI: `helm show crds <chart> --version "$VERSION" | kubectl apply --server-side --force-conflicts -f -`, minus the CRDs of an operator kept standalone (`helm show crds` prints every subchart's). Server-side, because five of these CRDs exceed client-side apply's 256 KiB annotation limit; `--force-conflicts`, because Helm or a GitOps tool created them.
+  - Flux: `install.crds` and `upgrade.crds` set to `CreateReplace`. Argo CD applies `crds/` on every sync and needs `ServerSideApply=true` for them.
+  - One procedure covers both operators. Spark's opt-in pre-upgrade hook (`hook.upgradeCrd`) has no KubeRay counterpart, and adds a Job, an image and CRD write access to every install and upgrade. A CRD-only release would expose the CRDs to `helm rollback` and `helm uninstall`, which can drop fields or delete every object: the risk `crds/` exists to avoid.
+  - `helm rollback` leaves these CRDs at the newer schema, so pin bumps are reviewed for CRD backward compatibility.
+- **Running workloads.** An upgrade restarts the operators' controllers, which resume reconciling existing RayClusters and SparkApplications. It must not restart their pods; the upgrade e2e asserts this with a live RayCluster.
+- **Order.** Phase A upgrades the control plane first: the chart's ConfigMap carries no credentials, so task pods must already read the Secret, and the new control plane changes nothing on hand-built clusters (Runtime contract). After Phase A, compute clusters upgrade first: chart changes that a control-plane release relies on (grants, Kueue configuration) ship in the same platform release and are additive, so a compute cluster may run one release ahead of its control plane, never behind.
+
+**Uninstall** is destructive for Kueue and runs in this order:
+
+1. Unmark the cluster (`scheduler_type` back to default), so no new workloads are labeled.
+2. Wait until `kubectl get workloads -n default` returns nothing.
+3. Uninstall `michelangelo-compute-queues`. The ClusterQueue and ResourceFlavor carry Kueue's in-use finalizer, which Kueue releases only once no workload holds quota, as step 2 ensures.
+4. Uninstall `michelangelo-compute`, or set `kueue.enabled=false`. Either one deletes Kueue's CRDs. Done before step 3, it would strand the queue objects behind finalizers that no controller clears.
+
+KubeRay's and Spark's CRDs survive, along with their objects, because Helm never deletes `crds/`; so does a chart-created credentials Secret. Uninstalling also deletes `ray-manager`, so deregister the cluster first. The order is not enforced: the Kueue chart offers no way to keep its CRDs, and a `lookup`-based guard would break offline rendering (`helm template`, GitOps).
+
+### Migrating existing clusters
+
+Helm installs over an existing object only if it carries the release's ownership metadata (the `meta.helm.sh/release-name` and `meta.helm.sh/release-namespace` annotations and the `app.kubernetes.io/managed-by: Helm` label) or, from Helm 3.17, with `--take-ownership`; otherwise the install aborts. Adding that metadata is how an object is *adopted* below.
+
+**Operator releases.** Taking over objects that another release owns would leave two releases claiming them, and uninstalling either would delete them. A standalone install therefore moves in one of two ways, per component:
+
+- **Replace.** Uninstall the standalone KubeRay or Spark release, then install the chart, applying its CRDs first (Upgrade), because Helm skips `crds/` that already exist. The CRDs, which Helm never deletes, keep existing RayClusters and SparkApplications alive, and the new operator resumes reconciling them. A standalone Kueue is different: uninstalling it deletes its CRDs with every Workload and queue, so drain it first as in steps 1–2 above.
+- **Keep.** Set `<subchart>.enabled=false` and keep the standalone release. The charts still provide the identity, the runtime objects and the queue objects, but that component's pin and enforced configuration no longer apply.
+
+**Hand-built objects,** from the registration guide or an older sandbox, are handled at the first install, which Phase A's control plane must precede (Order):
+
+| Object | At the first install |
+|---|---|
+| ServiceAccount `ray-manager`, Secret `ray-manager-token` | Adopted. Recreating either invalidates the registered token. |
+| ClusterRole `ray-manager`, ClusterRoleBinding `ray-manager-binding` | Deleted after the install, so dispatch never loses permission. Deleting them is what narrows `ray-manager`. |
+| ConfigMap `michelangelo-config` | Deleted just before the install, once its other keys are in `runtime.config`. Adopting it would keep the credential keys, because Helm leaves keys it never rendered. Pods that start in between wait until the chart recreates it. |
+| Secret `aws-credentials` | Left alone: the chart does not render it, and nothing Michelangelo runs on a compute cluster reads it. |
+| Queue objects | Adopted, or kept by hand and left out of `localQueues`. |
 
 ### Sandbox integration
 
-`sandbox.py` replaces its imperative KubeRay and Spark Operator installs and raw RBAC/queue manifests with one code path that runs both phases (with the CRD wait between them) against a named cluster:
+`sandbox.py` installs `michelangelo-compute` on every cluster that runs Ray or Spark workloads: the control-plane cluster in both modes, since Spark runs there until federated Spark dispatch ships, and each `--create-compute-cluster` cluster. The inference demo's remote clusters run neither and keep their own objects. The chart replaces the imperative KubeRay and Spark installs, `rbac-ray.yaml`, and the hand-built ConfigMap and Secret. Specifically:
 
-- **Dedicated compute clusters** (`--create-compute-cluster`): every provisioned cluster gets the full chart — for the first time including the Spark Operator; per-cluster `--compute-cluster-quotas` overrides and the demo project's LocalQueue ride phase 2 as a generated values file. `ma sandbox demo kueue` becomes "mark the Cluster CR" only, since the install is already done.
-- **Control plane doubling as the compute cluster** (default single-cluster sandbox): the chart installs with `kuberay-operator.enabled=false` (the sandbox already installs the operator there with its local image imports) and the Spark Operator either from the chart or toggled off if the existing install is kept; the chart contributes Kueue, the queue objects, and the RBAC.
+- `--exclude ray` and `--exclude spark` map to `kuberay-operator.enabled=false` and `spark-operator.enabled=false`.
+- Runtime values point at the control plane's MinIO and apiserver, over the shared Docker network from compute clusters.
+- On the control-plane cluster, the chart references the sandbox's existing credentials Secret (`create: false`). Compute clusters get the Secret from the chart.
+- A reused sandbox cluster is migrated as described in Migrating existing clusters.
+- `ma sandbox demo kueue` sets `kueue.enabled=true`, installs the queues chart with the demo quota (8 CPU, 16Gi), and marks the `Cluster` CR.
 
-### Design choices worth naming
+### Release and CI
 
-A few shapes in the values interface are deliberate rather than incidental, and are the places most likely to change as the platform grows:
+- **Release.** The charts live at `helm/michelangelo-compute` and `helm/michelangelo-compute-queues`. Each chart's `version` and `appVersion` equal the platform version (RFC-20260616), and the release workflow publishes both to `oci://ghcr.io/michelangelo-ai/michelangelo/charts` beside `michelangelo` and `michelangelo-llm-gateway`.
+- **Monitoring.** The subcharts' monitor toggles (Kueue `enablePrometheus`, KubeRay `metrics.serviceMonitor.enabled`, Spark `prometheus.podMonitor.create`) are surfaced, off by default like the other charts'.
+- **Render checks** run on every chart change: `helm dependency build`, `helm lint`, and template assertions. The assertions cover:
+  - the default profile;
+  - Kueue enabled;
+  - queues with two LocalQueues;
+  - each invariant failing as specified;
+  - the Configuration diff against upstream's default.
 
-- **One explicit `ray-manager` ClusterRole**, rather than binding an upstream aggregate role such as `edit`. The grant a compute cluster hands the control plane should be readable in one file and auditable by the operator installing it. The name predates Spark and is kept because registration tooling and docs reference it; the `grants` toggles say what it actually covers.
-- **LocalQueue per project, resolved by the control plane.** The chart renders whatever list it is given and never invents a queue; the naming convention belongs to the control plane (`localQueueTemplate`), and the list of projects belongs to whoever onboards projects. This is why an empty list is a valid, non-broken default.
-- **One `localQueueNamespace`**, because the control plane creates Ray resources in a single fixed namespace today. Multi-namespace is an Open question, and the schema is designed to grow into it (Spark already needs `spark.jobNamespaces`, which is the same list from the other side).
-- **Quota defaults that actually admit** (cpu 16 / memory 32Gi / gpu 4) so a fresh sandbox runs a workload without tuning. Production installs are expected to override `kueueQueues.quota` with values sized to real capacity — inert or zero defaults would make the sandbox path silently non-functional.
+  Both charts join the Helm versions that `compat-matrix.yml` tests (3.13 to 3.15, so 3.13 is the minimum) and the values API-surface check, which flags removed or renamed keys.
+- **End to end.** The existing sandbox e2e provisions through the chart, so its Ray and Spark jobs run on chart-installed operators. A new k3d job, running `helm test` after each install and upgrade:
+  - installs both charts with Kueue and admits one labeled RayCluster;
+  - migrates a hand-built cluster with a standalone KubeRay (Replace), running a Ray job before and after;
+  - upgrades from the previous released chart (for the first release, a build pinning older KubeRay and Spark Operator versions), CRD step included, with a RayCluster running throughout;
+  - uninstalls in the documented order.
 
 ## APIs and CRDs
 
-No new CRDs, protos, or service APIs. The chart's public surface is:
-
-- **The values interface above** — the operator contract for queue names, quotas, the LocalQueue list, identity names and grants, Spark namespaces and service account, and subchart toggles.
-- **Rendered objects.** The `ray-manager` SA/ClusterRole/ClusterRoleBinding render field-for-field identical to the raw manifest they replace (plus standard chart labels and, when `grants.spark` is on, the `sparkoperator.k8s.io` rule), and the queue objects render exactly the `ResourceFlavor`/`ClusterQueue`/`LocalQueue` contract documented in RFC-20260731 and the merged operator guide.
-- **CI contract.** A lint-and-render gate on every chart change: `helm dependency update`, `helm lint`, and template renders asserting that the default profile renders the identity, that disabling all three subcharts still renders the RBAC and no Deployment, that `kueueQueues.enabled=true` with a two-entry `localQueues` list renders the flavor, the ClusterQueue and both LocalQueues, and that the default profile renders none of them.
+There are no new CRDs, protos or service APIs. The public surface is both charts' values and enforced invariants, the rendered objects above, the OCI chart references, and the upgrade order.
 
 ## Alternatives considered
 
-### Alternative A: keep imperative installs (status quo)
-**Pros:** no new artifact; sandbox already works.
-**Cons:** no versioned unit, no upgrade/rollback, no operator-facing install; the Spark Operator floats unpinned; every new per-cluster component extends a Python-encoded sequence that docs must mirror by hand.
-**Why not chosen:** fails the single-artifact goal, and Kueue plus Spark would triple the imperative surface.
+**A. Keep the imperative installs (status quo).**
+- *Rejected:* no versioned unit, an unpinned Spark Operator, and docs that mirror a Python sequence by hand, which have already drifted.
 
-### Alternative B: no umbrella chart — document the upstream charts plus a tiny RBAC-only chart
-**Pros:** minimal code owned; upstream charts consumed directly.
-**Cons:** operators hand-compose four installs with an ordering constraint between two of them and a naming contract between two others; no single version pin ties "a Michelangelo compute cluster" together; the queue objects and manager `Configuration` still need to live somewhere, which recreates the umbrella chart in documentation form.
-**Why not chosen:** the composition and its ordering *are* the product; an umbrella chart is the standard Helm mechanism for exactly this.
+**B. Upstream charts as independent releases, plus a small chart for identity, runtime and queues.**
+- Each operator would keep its own release and cadence, but the composition contracts (the pins, Kueue's Configuration deltas, the Spark ServiceAccount name, the job namespaces) would move into per-adopter values files that nothing validates, and their drift is what this RFC removes.
+- *Rejected,* but the option survives: every subchart can be disabled and run standalone (Migrating existing clusters).
 
-### Alternative C: fold compute-side objects into `helm/michelangelo`
-**Pros:** one chart to maintain.
-**Cons:** the two charts install into different clusters with different cardinalities (one control plane, N compute clusters) and different lifecycles; a combined chart forces every compute value through the control-plane release and breaks RFC-20260427's deliberate "control plane only" boundary.
-**Why not chosen:** cluster role is the natural chart boundary; the default sandbox (one cluster playing both roles) is handled by installing both charts on it.
+**C. Fold the compute objects into `helm/michelangelo`.**
+- *Rejected:* the two charts target different clusters, with different cardinality (one versus N) and different lifecycles. When one cluster plays both roles, both charts are installed on it.
 
-### Alternative D: single-phase install via a Helm post-install hook Job
-**Pros:** one `helm install`; no phase-2 command to forget.
-**Cons:** the hook Job needs a kubectl image, its own RBAC, and in-cluster retry logic to wait out CRD establishment and webhook readiness; failures surface as opaque hook timeouts; hook-created resources sit outside normal release rendering (skipped by `helm template`/diff tooling).
-**Why not chosen:** two idempotent `helm upgrade` calls with an explicit `kubectl wait` between them are simpler, debuggable, and CI-testable; NOTES.txt prints the phase-2 command after phase 1 so it is hard to forget.
+**D. Queue objects in the operators' release, through a second run with different values or through a post-install hook.**
+- *Rejected:* one release cannot hold both (Why a second chart), a second run with different values cannot be expressed in GitOps, and hooks cannot own long-lived objects, which they recreate or orphan on every upgrade.
 
-### Alternative E: a Ray-only chart, with Spark packaged separately later
-**Pros:** smaller first chart; Spark's compute-cluster dispatch is not built yet.
-**Cons:** the Spark Operator is already part of every sandbox and the identity's stated scope; leaving it out ships a compute cluster that cannot run half of Michelangelo's batch workloads, and the service-account and namespace contracts are cheapest to fix while the chart is new.
-**Why not chosen:** the stack is Ray *and* Spark; the chart should say so from its first version even where the control-plane side arrives in a later RFC phase.
+**E. Ray first, Spark later.**
+- *Rejected:* the identity, the Spark ServiceAccount and namespace contracts, and the runtime objects are cheapest to fix while the chart is new, and a Ray-only cluster cannot run half of Michelangelo's batch workloads.
 
 ## Open questions
 
-- [ ] **Chart publishing.** The chart installs from a repo checkout today. Publish to an OCI registry (e.g. GHCR) and Artifact Hub? And what chart-version cadence relative to `appVersion` — the same question RFC-20260427 left open for the control-plane chart; the two should get one answer.
-- [ ] **Token Secret template.** Registration needs the `ray-manager` ServiceAccount's token copied to the control plane, which today is a manual step in the operator guide. Should `rayManager` grow an optional `createTokenSecret` that renders the `Secret` so bootstrap can read it off the cluster, or does the token belong strictly to the registration flow?
-- [ ] **Multi-namespace workloads.** When the control plane can create Ray resources in more than one namespace, `localQueueNamespace` and `spark.jobNamespaces` become one `workloadNamespaces` list (LocalQueue per project per namespace, optional namespace creation). Worth designing the values schema for that now, since it is a breaking shape change later.
-- [ ] **Where LocalQueues are authored.** The chart list and the per-project reference in `michelangelo-examples` produce the same object; is carrying both worth it, or should fleets standardize on one (chart for centrally managed projects, per-project YAML for self-service onboarding)?
-- [ ] **Kueue floor and Spark gate.** Is 0.15 the right floor, and should the chart default the `SparkApplicationIntegration` gate on as soon as the pinned Kueue supports it, or leave Spark gating opt-in until the integration leaves alpha?
-- [ ] **Who owns the object-storage credentials Secret and `michelangelo-config`?** Should the chart template them (defaulting the Secret name to controllermgr's `<release>-object-storage-credentials`, accepting the cross-chart name coupling), should controllermgr stop defaulting the name and require it be set per cluster, or should log persistence default to off for multi-cluster installs? See Cross-cluster coupling — as it stands, a dedicated compute cluster cannot start a Ray pod with default settings.
-- [ ] **Compute-cluster observability.** The chart installs three controllers that export Prometheus metrics (`kueue-controller-manager`, `kuberay-operator`, `spark-operator-controller`), but nothing on a compute cluster scrapes them, and queue-state visibility today is `kubectl get/describe clusterqueue`. Should the chart ship ServiceMonitors behind a `metrics.serviceMonitor.enabled` toggle, or does per-cluster monitoring belong entirely to the operator's own stack?
-- [ ] **Guarding CRD deletion.** Because Kueue's CRDs are release-managed, `helm uninstall` cascades into every `Workload` and queue object on the cluster. Should the chart stamp `helm.sh/resource-policy: keep` on the queue CRDs (safer uninstall, but leaves orphaned CRDs behind and complicates a genuine teardown), or is documenting uninstall as a drain operation sufficient?
-- [ ] **GPU install notes.** Add a `gpu.enabled`-style NOTES block (device-plugin verification, taints/tolerations gotchas for Ray and Spark pods) without taking on the NVIDIA stack itself?
+None in this RFC. Control-plane-created LocalQueues and the priority-class set are open in RFC-20260731.
 
 ## Rollout strategy
 
-### Phase A — chart with KubeRay, Spark Operator and RBAC
-`helm/michelangelo-compute` skeleton: kuberay-operator and spark-operator subcharts with their pins, `ray-manager` RBAC templates with the `grants` toggles, NOTES/README. Sandbox rewired to install the chart on every compute cluster (raw `rbac-ray.yaml` deleted, imperative operator installs removed); the operator guide's setup step becomes the chart install. CI lint/render gate added.
-**Backward compatibility:** rendered defaults are field-identical to the replaced manifests apart from chart labels; the Spark Operator lands on dedicated compute clusters for the first time but reconciles nothing until the control plane dispatches there; sandbox CLI flags are unchanged.
-
-### Phase B — Kueue subchart and queue objects
-Kueue 0.15-line subchart with the narrowed manager `Configuration`; `kueueQueues.*` templates — flavor, ClusterQueue, LocalQueue list, optional priority classes — behind the phase-2 gate; sandbox runs both phases with the CRD `kubectl wait` between them and folds `ma sandbox demo kueue`'s install into it. Per-cluster quota overrides arrive as phase-2 values (consumed later by RFC-20260731's multi-cluster sandbox).
-
-**Sequencing note.** Installing Kueue via this chart is safe on its own: the control plane stamps `kueue.x-k8s.io/queue-name` only on clusters whose `Cluster` CR carries `scheduler_type: SCHEDULER_TYPE_KUEUE` *and* only when `jobs.scheduler.backend: kueue` is set, and with `manageJobsWithoutQueueName` at its default `false` Kueue observes and admits nothing else. The moment a cluster is marked, RayClusters begin getting suspended, and suspension at any queue depth is only survivable once RFC-20260731's **Phase 0** (the creation-budget split) is in place. Phase B may therefore land before it, but marking production clusters should not. The operator guide should carry the same warning.
-
-### Rollback
-Each phase is independently revertible; reverting Phase A returns the sandbox to the raw-manifest path.
-
-Operationally the release is reversible, but reversal is **destructive on a live cluster** and the blast radius grows with each step — everything here is release-managed, so unwinding deletes objects rather than orphaning them:
-
-| Action | Effect | Safe when |
+| Phase | Ships | Compatibility |
 |---|---|---|
-| `helm rollback` to a prior revision | Re-applies that revision's objects; quota values and the LocalQueue list revert | Anytime — quota changes only re-gate *future* admissions; a removed LocalQueue strands that project's new jobs at validation (`KueueQueueNotFound`), visibly |
-| `--set kueueQueues.enabled=false` | **Deletes** the ClusterQueue/LocalQueues. Admitted workloads lose their queue and Kueue stops managing them; pending ones stay suspended with nothing to admit them | Cluster is drained, or you are immediately re-applying different queue objects |
-| `--set kueue.enabled=false` / `helm uninstall` | Removes the operator **and its CRDs**, cascading to every `Workload`/queue object on the cluster (see Namespace and lifecycle consequences) | Cluster is drained |
+| A | `michelangelo-compute` with KubeRay, the Spark Operator, the identity and the runtime contract (with the task-credentials change), plus the invariants, `helm test`, CI and OCI publishing. The sandbox switches to it. | The control plane upgrades first. The Spark Operator becomes pinned and lands on dedicated compute clusters, idle until federated Spark dispatch. A migrated cluster's `ray-manager` narrows to `default` once today's ClusterRole is deleted; the control plane uses nothing outside it. |
+| B | The Kueue subchart (opt-in) and `michelangelo-compute-queues`. `ma sandbox demo kueue` switches to them. | Inert until a cluster is marked. Marking clusters outside a sandbox waits for RFC-20260731 Phase 0. |
 
-Draining first (`kubectl get workload -A` empty) is the safe order for the bottom two rows. Unmarking a cluster (`scheduler_type` back to default) is the non-destructive rollback the control plane offers, and it touches no compute-cluster object.
+Rollback is a `helm rollback` of the affected release, and Kueue's removal follows the uninstall order above. Phase A's control plane rolls back only while no compute cluster runs the chart, because older task pods read credentials only from the ConfigMap.
 
 ## References
 
-- [RFC-20260427: Michelangelo Control Plane Helm Chart](../20260427-michelangelo-helmchart/20260427-michelangelo-helmchart.md)
-- [RFC-20260731: Kueue-Aware Multi-Cluster Assignment for Ray and Spark Workloads](../20260731-kueue-integration/20260731-kueue-integration.md) — the placement and Spark phases this chart installs for; its Phase 0 gates marking clusters, not installing this chart
-- [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985) — the Kueue scheduler backend on `main` and its operator guide, `docs/operator-guides/jobs/kueue-scheduler-backend.md`, whose manual install this chart packages
-- Operator guide: `docs/operator-guides/setup/register-a-compute-cluster-to-michelangelo-control-plane.md`
-- [kuberay-helm](https://github.com/ray-project/kuberay-helm) (kuberay-operator subchart)
-- [Kubeflow Spark Operator chart](https://github.com/kubeflow/spark-operator/tree/master/charts/spark-operator-chart) (spark-operator subchart; `spark.jobNamespaces`, `spark.serviceAccount.name`)
-- [Kueue installation](https://kueue.sigs.k8s.io/docs/installation/) (subchart: `oci://registry.k8s.io/kueue/charts/kueue`); [Kueue SparkApplication integration](https://kueue.sigs.k8s.io/docs/tasks/run/kubeflow/sparkapplications/)
-- [michelangelo-examples](https://github.com/michelangelo-ai/michelangelo-examples) — per-project `config/` layout the LocalQueue reference follows
+- [RFC-20260427](../20260427-michelangelo-helmchart/20260427-michelangelo-helmchart.md), the control-plane chart; [RFC-20260616](../20260616-release-process/20260616-release-process.md), coordinated releases and GHCR OCI charts; [RFC-20260731](../20260731-kueue-integration/20260731-kueue-integration.md), the queueing and placement semantics these charts install for.
+- [michelangelo#1985](https://github.com/michelangelo-ai/michelangelo/pull/1985), the Kueue backend. Guides: `docs/operator-guides/jobs/kueue-scheduler-backend.md` and `docs/operator-guides/setup/register-a-compute-cluster-to-michelangelo-control-plane.md`.
+- `helm/michelangelo-llm-gateway`, the precedent for wrapper invariants, OCI dependencies and chart publishing.
+- Upstream charts:
+  - [kuberay-operator](https://github.com/ray-project/kuberay-helm)
+  - [Kubeflow spark-operator](https://github.com/kubeflow/spark-operator/tree/master/charts/spark-operator-chart)
+  - Kueue (`oci://registry.k8s.io/kueue/charts/kueue`): [installation](https://kueue.sigs.k8s.io/docs/installation/), [waitForPodsReady](https://kueue.sigs.k8s.io/docs/tasks/manage/setup_wait_for_pods_ready/), [SparkApplication integration](https://kueue.sigs.k8s.io/docs/tasks/run/kubeflow/sparkapplications/)
+- Helm: [custom resource definitions best practices](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/).
