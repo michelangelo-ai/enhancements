@@ -88,7 +88,7 @@ flowchart LR
 | `spark-operator` (Kubeflow) | 2.5.2 | The latest release when this RFC was written. The floor is 2.4.0, which added the `spec.suspend` that Kueue requires. | `spark-operator.enabled` (`true`) |
 | `kueue` | 0.19.9 | The 0.19 line supports Kubernetes ≥ 1.29 and carries the Spark fixes RFC-20260731 depends on. 0.20 officially supports only Kubernetes ≥ 1.34 and stops serving `v1beta1`, so the pin moves to it, raising the chart's `kubeVersion`, when 0.19 stops receiving patches. | `kueue.enabled` (`false`) |
 
-Pins are exact and `Chart.lock` is committed. The published chart bundles its pinned subcharts, so installs need no upstream chart repository. Images still come from upstream registries, and air-gapped installs override each subchart's image repository. The chart declares `kubeVersion: ">=1.29.0-0"`, Kueue 0.19's floor, even with Kueue off, so that turning Kueue on stays a values change rather than a cluster upgrade; the other subcharts declare none.
+Pins are exact and `Chart.lock` is committed. The published chart bundles its pinned subcharts, so installs need no upstream chart repository. Images still come from upstream registries, and air-gapped installs override each subchart's image repository. The chart declares `kubeVersion: ">=1.29.0-0"`, Kueue 0.19's floor, even with Kueue off, so that turning Kueue on stays a values change rather than a cluster upgrade; none of the subcharts declares one.
 
 **One release of each chart per cluster,** named after the chart, in namespace `michelangelo-compute`:
 
@@ -298,7 +298,7 @@ Helm installs over an existing object only if it carries the release's ownership
 
 **Operator releases.** Taking over objects that another release owns would leave two releases claiming them, and uninstalling either would delete them. A standalone install therefore moves in one of two ways, per component:
 
-- **Replace.** Uninstall the standalone KubeRay or Spark release, then install the chart, applying its CRDs first (Upgrade), because Helm skips `crds/` that already exist. The CRDs, which Helm never deletes, keep existing RayClusters and SparkApplications alive, and the new operator resumes reconciling them. A standalone Kueue is different: uninstalling it deletes its CRDs with every Workload and queue, so drain it first as in steps 1–2 above.
+- **Replace.** Uninstall the standalone KubeRay or Spark release, then install the chart, applying its CRDs first (Upgrade), because Helm skips `crds/` that already exist. The CRDs, which Helm never deletes, keep existing RayClusters and SparkApplications alive, and the new operator resumes reconciling them. A standalone Kueue is different: uninstalling it deletes its CRDs with every Workload and queue, so drain it and delete its queue objects first, as in steps 1–3 above; the queues chart recreates them.
 - **Keep.** Set `<subchart>.enabled=false` and keep the standalone release. The charts still provide the identity, the runtime objects and the queue objects, but that component's pin and enforced configuration no longer apply.
 
 **Hand-built objects,** from the registration guide or an older sandbox, are handled at the first install, which Phase A's control plane must precede (Order):
@@ -306,10 +306,11 @@ Helm installs over an existing object only if it carries the release's ownership
 | Object | At the first install |
 |---|---|
 | ServiceAccount `ray-manager`, Secret `ray-manager-token` | Adopted. Recreating either invalidates the registered token. |
+| Role and RoleBinding `ray-manager`, ClusterRole and ClusterRoleBinding `ray-manager-clusterqueues` (Kueue read grants built by hand, RFC-20260731 0d) | Adopted. The chart's rules replace theirs. |
 | ClusterRole `ray-manager`, ClusterRoleBinding `ray-manager-binding` | Deleted after the install, so dispatch never loses permission. Deleting them is what narrows `ray-manager`. |
 | ConfigMap `michelangelo-config` | Deleted just before the install, once its other keys are in `runtime.config`. Adopting it would keep the credential keys, because Helm leaves keys it never rendered. Pods that start in between wait until the chart recreates it. |
 | Secret `aws-credentials` | Left alone: the chart does not render it, and nothing Michelangelo runs on a compute cluster reads it. |
-| Queue objects | Adopted, or kept by hand and left out of `localQueues`. |
+| Queue objects | With a kept Kueue, adopted, or kept by hand and left out of `localQueues`. Replacing Kueue deletes them first (Replace). |
 
 ### Sandbox integration
 
