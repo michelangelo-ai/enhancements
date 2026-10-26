@@ -3,7 +3,7 @@
 - **Status:** Draft
 - **Author(s):** @austingreco
 - **Created:** 2026-10-26
-- **Internal ERD:** Not linked. Maintainers should confirm applicability before advancing this draft; any required organizational approvals remain internal.
+- **Internal ERD:** N/A — OSS-only documentation-hosting proposal.
 
 ---
 
@@ -97,16 +97,15 @@ AWS is recommended for its familiar, lightweight operating model, not because th
 
 ## Open questions
 
-- [ ] Which project-owned AWS account, billing owner, and operational owner should host the site? Available allowances and required organizational approvals are not confirmed.
+- [ ] Which project-owned AWS account, billing owner, and operational owner should host the site? Available allowances and account access are not confirmed.
 - [ ] Who administers the existing DNS zone, and what root-domain alias configuration should be used?
-- [ ] Does this public documentation-only proposal require a linked internal ERD under the contribution policy? Confirm before advancing the draft; do not treat this RFC as an internal approval.
 - [ ] Which live version milestone should track implementation and cutover? Neither repository listed an open milestone on October 26, 2026.
 - [ ] What are current traffic and transfer volumes, and what alert thresholds and retention limits should we adopt?
 - [ ] Does the community agree that same-URL negotiation justifies migration, rather than retaining GitHub Pages with separate Markdown files?
 
 ## Rollout strategy
 
-This RFC remains **Draft** pending maintainer review, internal-ERD applicability, and milestone mapping. Follow the repository's shepherd and final-comment-period process; do not begin production migration before acceptance.
+This RFC remains **Draft** pending maintainer review and milestone mapping. Follow the repository's shepherd and final-comment-period process; do not begin production migration before acceptance.
 
 The process requires rollout to map to upcoming live GitHub version milestones. The [core repository milestones](https://github.com/michelangelo-ai/michelangelo/milestones) and [enhancements milestones](https://github.com/michelangelo-ai/enhancements/milestones) had no open milestones when checked on October 26, 2026. The shepherd must identify or establish the target milestone and update the mapping below before acceptance. This draft does not invent a release version or a cutover date.
 
