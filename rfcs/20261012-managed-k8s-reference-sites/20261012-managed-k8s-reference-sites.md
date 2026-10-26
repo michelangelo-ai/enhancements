@@ -1,6 +1,6 @@
 # RFC-20261012-managed-k8s-reference-sites: Production reference deployments of Michelangelo on managed Kubernetes (GKE and OKE)
 
-- **Status:** Draft
+- **Status:** Approved
 - **Author(s):** @sallycr
 - **Created:** 2026-10-12
 - **Internal ERD:** N/A
