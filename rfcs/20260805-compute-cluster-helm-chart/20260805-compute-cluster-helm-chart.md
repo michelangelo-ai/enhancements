@@ -230,6 +230,7 @@ Why each choice:
 | Object | API group | Resources | Verbs | Why |
 |---|---|---|---|---|
 | Role `ray-manager` in `default` | `ray.io` | `rayclusters`, `rayjobs` | create, get, list, watch, update, patch, delete | Today's grant, narrowed to the namespace the control plane uses |
+| Same Role | core (`""`) | `pods` | get, list, watch | The federated watchers' pod watch, which reports container and scheduling errors |
 | Same Role | `sparkoperator.k8s.io` | `sparkapplications` | Same as `ray.io` | Federated Spark dispatch (`grants.spark`) |
 | Same Role | `kueue.x-k8s.io` | `localqueues` | get, list, watch | The enqueue-time LocalQueue check, and RFC-20260731 Phase 2's watches (`grants.kueueRead`) |
 | ClusterRole `ray-manager-clusterqueues` | `kueue.x-k8s.io` | `clusterqueues` | get, list, watch | Phase 2's watches. ClusterQueues are cluster-scoped (`grants.kueueRead`) |
@@ -239,6 +240,7 @@ A binding of the same name grants each to the ServiceAccount `ray-manager` in `d
 Why these grants:
 
 - **A Role, not today's ClusterRole.** Every call the control plane makes to a compute cluster targets `default`, and its health probe (`/healthz`) needs no grant. Per-project namespaces would replicate the Role.
+- **Pod reads are not gated.** They are read-only, in the one namespace where the identity already creates workloads. The Spark grant is gated because it lets the identity run SparkApplications.
 - **The `ray-manager` name predates Spark** and is kept because registration references it.
 
 **What a leaked token can do.** Its holder can create RayClusters (and, with `grants.spark`, SparkApplications) in `default`. That means running arbitrary images there, under any ServiceAccount in that namespace, mounting any Secret in it, the object-storage credentials included. It reaches nothing outside `default` except read access to ClusterQueues. `default` on a compute cluster should therefore hold only Michelangelo workloads and their runtime objects.
