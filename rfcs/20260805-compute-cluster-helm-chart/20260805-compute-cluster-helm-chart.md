@@ -86,7 +86,7 @@ flowchart LR
 |---|---|---|---|
 | `kuberay-operator` | 1.7.1 | It is what the sandbox runs today (michelangelo#2200), and it matches the History Server collector (v1.7) that controllermgr injects. Kueue's RayCluster integration needs ≥ 1.1.0. | `kuberay-operator.enabled` (`true`) |
 | `spark-operator` (Kubeflow) | 2.5.2 | The latest release when this RFC was written. The floor is 2.4.0, which added the `spec.suspend` that Kueue requires. | `spark-operator.enabled` (`true`) |
-| `kueue` | 0.19.9 | The 0.19 line supports Kubernetes ≥ 1.29 and carries the Spark fixes RFC-20260731 depends on. 0.20 officially supports only Kubernetes ≥ 1.34 and stops serving `v1beta1`, so the pin moves to it, raising the chart's `kubeVersion`, when 0.19 stops receiving patches. | `kueue.enabled` (`false`) |
+| `kueue` | 0.19.9 | The 0.19 line supports Kubernetes ≥ 1.29, serves `v1beta2`, which the control plane queries by default (`jobs.scheduler.kueue.apiVersion`), and carries the Spark fixes RFC-20260731 depends on. 0.20 officially supports only Kubernetes ≥ 1.34 and stops serving `v1beta1`, so the pin moves to it, raising the chart's `kubeVersion`, when 0.19 stops receiving patches. | `kueue.enabled` (`false`) |
 
 Pins are exact and `Chart.lock` is committed. The published chart bundles its pinned subcharts, so installs need no upstream chart repository. Images still come from upstream registries, and air-gapped installs override each subchart's image repository. The chart declares `kubeVersion: ">=1.29.0-0"`, Kueue 0.19's floor, even with Kueue off, so that turning Kueue on stays a values change rather than a cluster upgrade; none of the subcharts declares one.
 
