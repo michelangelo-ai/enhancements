@@ -228,16 +228,15 @@ No CRD or proto changes are introduced by this RFC. The public surface it adds o
 
 ## Open questions
 
-- [ ] **Which cloud first.** This RFC proposes GKE v0, then OKE v0.1, with the same gate. Owners to confirm or invert.
+- [ ] **Which cloudofirst.** This RFC proposes GKE v0, then OKE v0.1, with the same gate. 
 - [ ] **Environment ownership.** Who owns, operates and funds each reference site; whether each is publicly reachable; budget and quotas for the cluster, database and object store per cloud.
 - [ ] **Identity provider per environment** (issuer, audience, claim and group mapping). Environment-specific details stay in privately maintained modules.
-- [ ] **Interface reconciliation.** Adapt the open PR stack onto #2199's `Authenticator`/`TokenSource` contracts, or retire those in favor of the `k8s.io/apiserver` contracts? Who rebases the stack, and in what order (#1852 first)?
-- [ ] **Double authentication.** When #2199's inbound middleware and the stack's handler-level token resolution are both active, is the token validated twice, and does that matter? Needs a spike.
+- [ ] **Interface reconciliation.** Adapt the open PR stack onto #2199's `Authenticator`/`TokenSource` contracts.
 - [ ] **Authorization model.** Confirm the layering of RFC #16's roles over RFC #20's RBAC (one enforcement path), and converge value naming (`auth.rbac.groupRoleMapping` vs `apiserver.auth.groupRoleMapping`).
 - [ ] **Authorization seam shape.** Custom authorizer interface versus the `k8s.io/apiserver` `authorizer.Authorizer` contract.
 - [ ] **List semantics** for namespace-scoped users (deny cluster-wide List, or fan out per-namespace checks); inherited from RFC #20.
-- [ ] **UI token path.** Does the auth proxy forward the original token, or does the apiserver trust proxy-supplied headers? (See RFC #20.)
-- [ ] **Object storage on each cloud.** (1) Can the chart select the native GCS client, and is keyless access via Workload Identity then possible? Without it, GKE uses static HMAC keys through the S3 path. (2) Do all object-store client calls in the apiserver, worker and the Ray log collector work against OCI Object Storage's S3 Compatibility API, including addressing style and region settings? (3) Can static keys be rotated safely from the secret store?
+- [ ] **UI token path.** Does the auth proxy forward the original token.
+- [ ] **Object storage on each cloud.** (1) Can the chart select the native GCS client, and is keyless access via Workload Identity then possible? Without it, GKE uses static HMAC keys through the S3 path. (2) Do all object-store client calls in the apiserver, worker and the Ray log collector work against OCI Object Storage's S3 Compatibility API, including addressing style and region settings? (3) Can static keys be rotated safely from the secret store? 
 - [ ] **Managed MySQL on each cloud.** Version compatibility with the chart's schema and migrations, TLS client configuration, private connectivity, and high availability behavior for both Cloud SQL and OCI's MySQL service.
 - [ ] **Certificates on each cloud.** Terminate TLS at the load balancer with a cloud-managed certificate, or in-cluster with cert-manager? The overlays must state which, and the apiserver-side TLS requirement differs.
 - [ ] **Secret store integration.** Confirm ESO provider maturity and supported auth modes for each cloud's secret service; decide ESO versus a CSI driver as the documented default.
@@ -246,8 +245,6 @@ No CRD or proto changes are introduced by this RFC. The public surface it adds o
 - [ ] **Per-project runner ServiceAccount provisioning:** Helm over a known project list, or a project-creation hook.
 - [ ] **Cluster shape per environment** (private cluster, node pools, policy-enforcing CNI, pod security level), managed versus in-cluster workflow engine, compliance requirements, and load targets (replicas, database sizing, workflow throughput).
 - [ ] **Cloud CI lanes:** hosting accounts, budget, expected per-run cost and provisioning time (none measured), and whether they run from public CI.
-- [ ] **Sandbox-impact exceptions.** Several hardening items (NetworkPolicy, database TLS, workflow-engine TLS, seccomp, ServiceAccount split) touch resources the sandbox also uses. Are overlay-only variants acceptable, or must the sandbox overlay re-set values explicitly?
-- [ ] **Out-of-tree consumers.** Are there downstream modules built on #2199's hooks that #1988's breaking change would affect?
 
 ## Rollout strategy
 
@@ -309,4 +306,7 @@ Existing users change nothing. Operators who want production behavior adopt `val
 - michelangelo-ai/enhancements#25: Migrate object storage from MinIO to SeaweedFS
 - Repository `SECURITY.md`: how to report vulnerabilities
 - Vendor documentation cited in the per-cloud options table: [GCS interoperability](https://docs.cloud.google.com/storage/docs/interoperability), [Workload Identity Federation for GKE](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity), [OCI Object Storage S3 Compatibility API](https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm), [OKE workload access to OCI resources](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contenggrantingworkloadaccesstoresources.htm), [External Secrets Operator: Oracle Vault](https://external-secrets.io/latest/provider/oracle-vault/), [OCI MySQL HeatWave overview](https://docs.oracle.com/en-us/iaas/mysql-database/doc/overview-mysql-database-service.html), [OKE load balancers](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengcreatingloadbalancers-subtopic.htm), [OKE image pulls from OCIR](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contengpullingimagesfromocir.htm)
+
+## Issues
+
 - michelangelo-ai/michelangelo#2472: tracking issue for the Terraform-provisioned GKE and OKE reference clusters that follow this RFC
