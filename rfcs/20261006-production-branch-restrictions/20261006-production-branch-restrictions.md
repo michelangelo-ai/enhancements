@@ -1,6 +1,6 @@
 # RFC-20261006-production-branch-restrictions: Configurable Production-Branch Restrictions
 
-- **Status:** Draft
+- **Status:** In Progress
 - **Author(s):** @sallycr
 - **Created:** 2026-10-06
 - **Internal ERD:** N/A
