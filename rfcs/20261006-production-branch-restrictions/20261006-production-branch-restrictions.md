@@ -3,7 +3,6 @@
 - **Status:** In Progress
 - **Author(s):** @sallycr
 - **Created:** 2026-10-06
-- **Internal ERD:** N/A
 
 ---
 
